@@ -14,6 +14,7 @@
   --line:#d9cdb2;
   --card:#fdfaf1;
   --muted:#7a6f5a;
+  --font:var(--serif);
   --sans:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
   --serif:"Songti SC","Noto Serif CJK SC","Source Han Serif SC","SimSun","Times New Roman",serif;
 }
@@ -81,7 +82,7 @@ input[type=color]::-webkit-color-swatch{border:none;border-radius:4px}
 #page-container{position:absolute;inset:0;overflow:hidden}
 #page-inner{height:100%;overflow:hidden;padding:clamp(28px,6vh,64px) clamp(24px,7vw,80px)}
 .reader-text{
-  font-family:var(--serif);
+  font-family:var(--font);
   white-space:pre-wrap;
   overflow-wrap:break-word;
   text-align:justify;
@@ -105,6 +106,13 @@ input[type=color]::-webkit-color-swatch{border:none;border-radius:4px}
 #progress-line{
   position:absolute;left:0;bottom:0;height:3px;width:0;
   background:var(--accent);transition:width .2s linear;
+}
+#auto-pill{
+  position:absolute;top:12px;left:50%;transform:translateX(-50%);
+  background:var(--accent);color:#fdfaf1;font-size:12px;line-height:1;
+  padding:6px 14px;border-radius:999px;z-index:20;
+  box-shadow:0 3px 10px rgba(0,0,0,.15);pointer-events:none;
+  white-space:nowrap;
 }
 
 /* ===== 落地页 ===== */
@@ -249,6 +257,7 @@ input[type=color]::-webkit-color-swatch{border:none;border-radius:4px}
       <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 5l7 7-7 7"/></svg>
     </div>
     <div id="progress-line"></div>
+    <div id="auto-pill" hidden>自动翻页</div>
   </div>
 </div>
 
@@ -296,6 +305,46 @@ input[type=color]::-webkit-color-swatch{border:none;border-radius:4px}
     </div>
 
     <div class="m-row">
+      <span class="m-label">字体</span>
+      <div class="m-controls">
+        <select class="enc" id="font-select" aria-label="正文字体">
+          <option value="">默认</option>
+          <option value="宋体 (SimSun)">宋体 (SimSun)</option>
+          <option value="黑体 (SimHei)">黑体 (SimHei)</option>
+          <option value="微软雅黑 (Microsoft YaHei)">微软雅黑 (Microsoft YaHei)</option>
+          <option value="楷体 (KaiTi)">楷体 (KaiTi)</option>
+          <option value="仿宋 (FangSong)">仿宋 (FangSong)</option>
+          <option value="等线 (DengXian)">等线 (DengXian)</option>
+          <option value="隶书 (LiSu)">隶书 (LiSu)</option>
+          <option value="幼圆 (YouYuan)">幼圆 (YouYuan)</option>
+          <option value="Arial">Arial</option>
+          <option value="Georgia">Georgia</option>
+          <option value="Times New Roman">Times New Roman</option>
+          <option value="Verdana">Verdana</option>
+          <option value="Courier New">Courier New</option>
+          <option value="等宽 (monospace)">等宽 (monospace)</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="m-row">
+      <span class="m-label">自动翻页</span>
+      <div class="m-controls">
+        <select class="enc" id="auto-rate" aria-label="自动翻页间隔">
+          <option value="0.5">0.5s</option>
+          <option value="0.75">0.75s</option>
+          <option value="1" selected>1s</option>
+          <option value="1.5">1.5s</option>
+          <option value="2">2s</option>
+          <option value="2.5">2.5s</option>
+          <option value="3">3s</option>
+        </select>
+        <span class="m-val lh" id="auto-state">已停止</span>
+      </div>
+      <p class="m-hint">空格键 启动 / 停止，每次上移一行</p>
+    </div>
+
+    <div class="m-row">
       <span class="m-label">目录</span>
       <div class="m-controls">
         <button class="btn sm" id="toc-btn" type="button">打开目录</button>
@@ -333,15 +382,33 @@ input[type=color]::-webkit-color-swatch{border:none;border-radius:4px}
 /* ================= 状态 ================= */
 var STATE={
   rawBuf:null, text:'', name:'', total:0,
-  fontSize:19, lineHeight:1.9, fg:'#332d24', bg:'#f3ecdd',
+  fontSize:19, lineHeight:1.9, fg:'#332d24', bg:'#f3ecdd', font:'',
   enc:'utf-8',
   pageStarts:[0], k:0,
   menuOpen:false, tocOpen:false,
+  autoMs:1000, autoRunning:false, autoTimer:null, autoTickCount:0,
   gbkOK:true,
   dragX:0, dragY:0
 };
 var STORE_PREFIX='txt-reader:v1:';
 var FONT_MIN=14, FONT_MAX=32, FONT_STEP=2;
+/* 系统字体选项：value 存下拉项，栈用于实际渲染（含跨平台 fallback） */
+var FONTS={
+  '宋体 (SimSun)':'SimSun,"Songti SC","Noto Serif CJK SC","Source Han Serif SC",serif',
+  '黑体 (SimHei)':'SimHei,"Heiti SC","Noto Sans CJK SC","Source Han Sans SC",sans-serif',
+  '微软雅黑 (Microsoft YaHei)':'Microsoft YaHei,"PingFang SC","Hiragino Sans GB",sans-serif',
+  '楷体 (KaiTi)':'KaiTi,"Kaiti SC",STKaiti,serif',
+  '仿宋 (FangSong)':'FangSong,STFangsong,serif',
+  '等线 (DengXian)':'DengXian,"Source Han Sans SC",sans-serif',
+  '隶书 (LiSu)':'LiSu,STLiti,serif',
+  '幼圆 (YouYuan)':'YouYuan,STYuanti,sans-serif',
+  'Arial':'Arial,"Helvetica Neue",sans-serif',
+  'Georgia':'Georgia,"Times New Roman",serif',
+  'Times New Roman':'Times New Roman,SimSun,serif',
+  'Verdana':'Verdana,Geneva,sans-serif',
+  'Courier New':'Courier New,Consolas,monospace',
+  '等宽 (monospace)':'ui-monospace,Consolas,"Courier New",monospace'
+};
 
 /* ================= DOM ================= */
 function $(id){ return document.getElementById(id); }
@@ -359,6 +426,7 @@ var fileInput=$('file-input'), encLand=$('enc-landing'), encHead=$('enc-header')
     bgColor=$('bg-color'), bgHex=$('bg-hex'),
     tocBtn=$('toc-btn'), tocCount=$('toc-count'), tocTitle=$('toc-title'),
     tocOverlay=$('toc-overlay'), tocPanel=$('toc-panel'), tocList=$('toc-list'), tocClose=$('toc-close'),
+    fontSelect=$('font-select'), autoRate=$('auto-rate'), autoState=$('auto-state'), autoPill=$('auto-pill'),
     menuClose=$('menu-close'), toastEl=$('toast');
 
 /* ================= 工具 ================= */
@@ -390,6 +458,8 @@ function saveRecord(){
     lineHeight:STATE.lineHeight,
     fg:STATE.fg,
     bg:STATE.bg,
+    font:STATE.font,
+    autoMs:STATE.autoMs,
     vw:window.innerWidth,
     vh:window.innerHeight,
     savedAt:Date.now()
@@ -489,6 +559,7 @@ function updateChrome(){
   progressText.textContent=p.toFixed(1)+'%';
 }
 function jumpTo(t, doSave){
+  stopAuto(true);
   STATE.pageStarts=[clamp(Math.round(t),0,STATE.total)];
   STATE.k=0;
   render();
@@ -498,6 +569,7 @@ function jumpTo(t, doSave){
 /* ================= 翻页 ================= */
 function nextPage(){
   if(!STATE.text) return;
+  stopAuto(true);
   var starts=STATE.pageStarts, k=STATE.k;
   if(k+1<starts.length){
     STATE.k++;
@@ -512,6 +584,7 @@ function nextPage(){
 }
 function prevPage(){
   if(!STATE.text) return;
+  stopAuto(true);
   var starts=STATE.pageStarts, k=STATE.k;
   if(k>0){
     STATE.k--;
@@ -523,6 +596,81 @@ function prevPage(){
   }
   render();
   saveRecord();
+}
+
+/* ================= 自动翻页（逐行推进） ================= */
+/* 从 start 起最多能容纳多少字符使其不超过一行高度（即"一行的字符量"） */
+function lineEndAt(start){
+  var remaining=STATE.total-start;
+  if(remaining<=0) return start;
+  layoutMetrics();
+  var lineHpx=STATE.fontSize*STATE.lineHeight;
+  var hi=Math.min(remaining, 2000);
+  while(hi<remaining && measureChars(start, hi)<=lineHpx){
+    hi=Math.min(remaining, hi*2);
+  }
+  if(measureChars(start, hi)<=lineHpx) return start+hi;
+  var lo=1;
+  if(measureChars(start, 1)>lineHpx) return start+1;
+  while(lo+1<hi){
+    var mid=(lo+hi)>>1;
+    if(measureChars(start, mid)<=lineHpx) lo=mid; else hi=mid;
+  }
+  return start+lo;
+}
+function updateAutoPill(){
+  autoPill.hidden=!STATE.autoRunning;
+  if(STATE.autoRunning){
+    autoPill.textContent='自动翻页 · '+fmtAutoSec()+'/行';
+  }
+  autoState.textContent=STATE.autoRunning?'运行中':'已停止';
+}
+function fmtAutoSec(){
+  var s=(STATE.autoMs/1000).toFixed(2);
+  return s.replace(/\.?0+$/,'');
+}
+function autoTick(){
+  if(!STATE.text) return;
+  var le=lineEndAt(curStart());
+  if(le>=STATE.total){
+    stopAuto(false);
+    toast('已到全书末尾');
+    return;
+  }
+  STATE.pageStarts.push(le);
+  STATE.k++;
+  if(STATE.pageStarts.length>4000){
+    STATE.pageStarts.splice(0,2000);
+    STATE.k-=2000;
+  }
+  STATE.autoTickCount++;
+  render();
+  if(STATE.autoTickCount%8===0) saveRecord();
+}
+function startAuto(){
+  if(!STATE.text || STATE.autoRunning) return;
+  STATE.autoRunning=true;
+  STATE.autoTickCount=0;
+  closeMenu();
+  updateAutoPill();
+  STATE.autoTimer=setInterval(autoTick, STATE.autoMs);
+  toast('自动翻页已开启（'+fmtAutoSec()+'s/行），空格键停止');
+}
+function stopAuto(silent){
+  if(STATE.autoTimer){
+    clearInterval(STATE.autoTimer);
+    STATE.autoTimer=null;
+  }
+  if(STATE.autoRunning){
+    STATE.autoRunning=false;
+    updateAutoPill();
+    saveRecord();
+    if(!silent) toast('自动翻页已停止');
+  }
+}
+function toggleAuto(){
+  if(!STATE.text) return;
+  STATE.autoRunning ? stopAuto(false) : startAuto();
 }
 
 /* ================= 样式 ================= */
@@ -537,6 +685,12 @@ function applyStyle(fs,lh,fg,bg){
   measureEl.style.fontSize=STATE.fontSize+'px';
   measureEl.style.lineHeight=STATE.lineHeight;
   document.body.style.background=STATE.bg;
+  document.documentElement.style.setProperty('--font', STATE.font ? FONTS[STATE.font] : 'var(--serif)');
+  syncMenuControls();
+}
+function applyFont(f){
+  STATE.font=FONTS[f]!==undefined ? f : '';
+  document.documentElement.style.setProperty('--font', STATE.font ? FONTS[STATE.font] : 'var(--serif)');
   syncMenuControls();
 }
 function setFg(v){ if(!isHex(v)) return; STATE.fg=v.toLowerCase(); pageText.style.color=STATE.fg; fgColor.value=STATE.fg; fgHex.value=STATE.fg; saveRecord(); }
@@ -551,11 +705,14 @@ function syncMenuControls(){
   lhVal.textContent=STATE.lineHeight.toFixed(2);
   fgColor.value=STATE.fg; fgHex.value=STATE.fg;
   bgColor.value=STATE.bg; bgHex.value=STATE.bg;
+  fontSelect.value=STATE.font;
+  autoRate.value=String(STATE.autoMs/1000);
+  autoState.textContent=STATE.autoRunning?'运行中':'已停止';
   tocCount.textContent=TOC.length ? TOC.length+' 章' : '…';
 }
 
 /* ================= 菜单 ================= */
-function openMenu(){ STATE.menuOpen=true; overlay.hidden=false; syncMenuControls(); }
+function openMenu(){ stopAuto(true); STATE.menuOpen=true; overlay.hidden=false; syncMenuControls(); }
 function closeMenu(){ STATE.menuOpen=false; overlay.hidden=true; }
 function toggleMenu(){ STATE.menuOpen ? closeMenu() : openMenu(); }
 
@@ -569,6 +726,7 @@ function showReader(){
   reader.hidden=false;
 }
 function applyText(name, text){
+  stopAuto(true);
   text=normalize(text);
   STATE.name=name;
   STATE.text=text;
@@ -577,6 +735,8 @@ function applyText(name, text){
   if(STATE.total>60*1024*1024){ toast('文件较大，分页与跳转可能稍慢'); }
 
   var rec=loadRecord(name);
+  if(rec && typeof rec.font==='string' && FONTS[rec.font]!==undefined) STATE.font=rec.font;
+  if(rec && typeof rec.autoMs==='number' && rec.autoMs>=500 && rec.autoMs<=3000) STATE.autoMs=rec.autoMs;
   STATE.pageStarts=[0]; STATE.k=0;
   tocCount.textContent='…';
   setTimeout(buildToc, 0);
@@ -758,12 +918,38 @@ pageContainer.addEventListener('mouseleave', function(){
   hintR.classList.remove('on');
 });
 
+/* 鼠标滚轮翻页（向下=下一页，向上=上一页），节流防连翻 */
+var lastWheelTs=0;
+pageContainer.addEventListener('wheel', function(e){
+  if(STATE.menuOpen || STATE.tocOpen || !STATE.text) return;
+  e.preventDefault();
+  var now=Date.now();
+  if(now-lastWheelTs<280) return;
+  lastWheelTs=now;
+  if(e.deltaY>0) nextPage();
+  else if(e.deltaY<0) prevPage();
+}, {passive:false});
+
 /* 菜单 */
 overlay.addEventListener('click', closeMenu);
 menu.addEventListener('click', function(e){ e.stopPropagation(); });
 menuClose.addEventListener('click', closeMenu);
 fontDec.addEventListener('click', function(){ changeFont(-FONT_STEP); });
 fontInc.addEventListener('click', function(){ changeFont(FONT_STEP); });
+fontSelect.addEventListener('change', function(){
+  applyFont(this.value);
+  render(); saveRecord();
+});
+autoRate.addEventListener('change', function(){
+  STATE.autoMs=parseFloat(this.value)*1000;
+  if(STATE.autoRunning){
+    clearInterval(STATE.autoTimer);
+    STATE.autoTimer=setInterval(autoTick, STATE.autoMs);
+    updateAutoPill();
+  }
+  autoState.textContent=STATE.autoRunning?'运行中':'已停止';
+  saveRecord();
+});
 lhRange.addEventListener('input', function(){ lhVal.textContent=(+this.value).toFixed(2); });
 lhRange.addEventListener('change', function(){
   applyStyle(STATE.fontSize, +this.value, STATE.fg, STATE.bg);
@@ -790,6 +976,12 @@ document.addEventListener('keydown', function(e){
   if(tag==='INPUT'||tag==='SELECT'||tag==='TEXTAREA') return;
   if(e.key==='ArrowLeft'){ e.preventDefault(); prevPage(); }
   else if(e.key==='ArrowRight'){ e.preventDefault(); nextPage(); }
+  else if(e.code==='Space'){
+    if(!STATE.menuOpen && !STATE.tocOpen){
+      e.preventDefault();
+      toggleAuto();
+    }
+  }
 });
 
 /* 窗口尺寸变化：防抖后重新分页 */
@@ -832,6 +1024,8 @@ window.Reader={
   nextPage:nextPage, prevPage:prevPage,
   openMenu:openMenu, closeMenu:closeMenu,
   openToc:openToc, closeToc:closeToc, jumpTo:jumpTo,
+  setFont:applyFont, toggleAuto:toggleAuto, startAuto:startAuto, stopAuto:stopAuto,
+  lineEndAt:lineEndAt, autoTick:autoTick,
   curStart:curStart, getToc:function(){ return TOC; },
   getState:function(){ return STATE; }
 };
