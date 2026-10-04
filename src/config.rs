@@ -42,6 +42,12 @@ pub struct Config {
 
     /// 始终置顶
     pub always_on_top: bool,
+
+    /// 老板模式：鼠标离开窗口时自动隐藏（老板键效果）
+    pub auto_hide_on_mouse_leave: bool,
+
+    /// 是否显示顶部标题栏（自绘状态栏）
+    pub show_titlebar: bool,
 }
 
 impl Default for Config {
@@ -58,6 +64,8 @@ impl Default for Config {
             min_width: 180.0,
             min_height: 120.0,
             always_on_top: false,
+            auto_hide_on_mouse_leave: false,
+            show_titlebar: true,
         }
     }
 }
