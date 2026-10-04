@@ -1,3 +1,27 @@
+# ---------------------------------------------------------------------------
+# 构建说明（重要）
+# ---------------------------------------------------------------------------
+# 1) 只需要在 Windows 10/11 上运行（普通编译，稳定版即可，最省事）：
+#       cargo build --release
+#    （Windows 上用 MSVC 工具链时，本文件 x86_64-pc-windows-gnu 段不生效，
+#      不会干扰你的编译；不会走 build-std，稳定版可直接编译。）
+#
+# 2) 需要在 Windows 7 上运行（需 nightly + 重新编译标准库）：
+#       rustup toolchain install nightly
+#       rustup component add rust-src --toolchain nightly
+#       rustup target add x86_64-pc-windows-gnu --toolchain nightly
+#       cargo +nightly build --release -Z build-std=std,panic_abort \
+#           --target x86_64-pc-windows-gnu
+#    target_vendor="win7" 会启用标准库内建的 Win7 兼容回退，避免引入
+#    Windows 8/10 才有的 API（GetSystemTimePreciseAsFileTime、WaitOnAddress、
+#    ProcessPrng），从而保证生成的 EXE 能在 Windows 7 上运行。
+# ---------------------------------------------------------------------------
+
 [target.x86_64-pc-windows-gnu]
+# 仅在使用 GNU 交叉/交叉工具链时生效；在 Windows 上用 MSVC 默认工具链编译时，
+# 本段不会干扰你的普通 `cargo build --release`。
 linker = "x86_64-w64-mingw32-gcc"
 ar = "x86_64-w64-mingw32-ar"
+# -A explicit_builtin_cfgs_in_flags：允许手动设置内置 cfg target_vendor，
+# 以便给 std 启用 Win7 兼容回退。仅配合上方第 2 条（nightly + build-std）时生效。
+rustflags = ["--cfg", "target_vendor=\"win7\"", "-A", "explicit_builtin_cfgs_in_flags"]
