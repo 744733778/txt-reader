@@ -21,6 +21,9 @@ pub fn measure_chars(
     max_width: f32,
     font_family: &FontFamily,
 ) -> f32 {
+    // start 也可能是非字符边界字节索引（prev_boundary 二分搜索会传入任意字节索引），
+    // 必须先取整，否则 &text[start..end] 会 panic（中文多字节字符）。
+    let start = floor_char_boundary(text, start);
     let end = floor_char_boundary(text, (start + count).min(text.len()));
     let slice = &text[start..end];
     if slice.is_empty() {
