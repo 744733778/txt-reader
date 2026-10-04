@@ -1,5 +1,6 @@
 use crate::config::{Config, ProgressRecord};
 use crate::fonts;
+use crate::log;
 use crate::pagination;
 use crate::toc::{ChapterMatcher, TocItem};
 use eframe::egui;
@@ -9,6 +10,8 @@ use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const FONT_MIN: f32 = 14.0;
@@ -50,6 +53,22 @@ mod win32 {
     const SW_HIDE: i32 = 0;
     const SW_SHOW: i32 = 5;
 
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct POINT {
+        x: i32,
+        y: i32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct RECT {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+
     #[link(name = "user32")]
     extern "system" {
         fn IsWindowVisible(h_wnd: isize) -> i32;
@@ -60,7 +79,17 @@ mod win32 {
             l_param: isize,
         ) -> i32;
         fn GetWindowThreadProcessId(h_wnd: isize, lpdw_process_id: *mut u32) -> u32;
+        fn GetCursorPos(lp_point: *mut POINT) -> i32;
+        fn GetWindowRect(h_wnd: isize, lp_rect: *mut RECT) -> i32;
+        fn SetCursorPos(x: i32, y: i32) -> i32;
+        fn PtInRect(lp_rect: *const RECT, pt: POINT) -> i32;
+        fn ReleaseCapture() -> i32;
+        fn SendMessageW(h_wnd: isize, msg: u32, w_param: isize, l_param: isize) -> isize;
+        fn BringWindowToTop(h_wnd: isize) -> i32;
     }
+
+    const WM_NCLBUTTONDOWN: u32 = 0x00A1;
+    const HTCAPTION: isize = 0x0002;
 
     static FOUND_HWND: AtomicIsize = AtomicIsize::new(0);
 
@@ -100,11 +129,75 @@ mod win32 {
             }
         }
     }
+
+    /// 直接隐藏窗口（老板键效果）
+    pub fn hide_window() {
+        let Some(h) = find_window() else { return };
+        unsafe {
+            ShowWindow(h, SW_HIDE);
+        }
+    }
+
+    /// 判断鼠标是否位于窗口矩形内。
+    /// 窗口已隐藏时一律视为“在窗口内”，避免反复触发隐藏造成抖动。
+    pub fn is_cursor_inside() -> bool {
+        let Some(h) = find_window() else { return true };
+        unsafe {
+            if IsWindowVisible(h) == 0 {
+                return true;
+            }
+            let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+            GetWindowRect(h, &mut r);
+            let mut p = POINT { x: 0, y: 0 };
+            GetCursorPos(&mut p);
+            PtInRect(&r, p) != 0
+        }
+    }
+
+    /// 将鼠标移动到窗口中心（用于程序启动时把鼠标置于界面内）
+    pub fn place_cursor_inside() {
+        let Some(h) = find_window() else { return };
+        unsafe {
+            let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+            GetWindowRect(h, &mut r);
+            let cx = (r.left + r.right) / 2;
+            let cy = (r.top + r.bottom) / 2;
+            SetCursorPos(cx, cy);
+        }
+    }
+
+    /// 确保窗口获得焦点并置顶（首次点击可能只聚焦窗口，导致第一次拖动被吞）
+    pub fn focus_window() {
+        if let Some(h) = find_window() {
+            unsafe {
+                SetForegroundWindow(h);
+                BringWindowToTop(h);
+            }
+        }
+    }
+
+    /// 无边框模式拖动窗口：先聚焦，再向系统发送 WM_NCLBUTTONDOWN+HTCAPTION，
+    /// 让操作系统原生接管窗口移动（自定义标题栏的标准做法，可靠且无需手动算位置）。
+    pub fn start_window_drag() {
+        focus_window();
+        let Some(h) = find_window() else { return };
+        unsafe {
+            ReleaseCapture();
+            SendMessageW(h, WM_NCLBUTTONDOWN, HTCAPTION, 0);
+        }
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
 mod win32 {
     pub fn toggle_window() {}
+    pub fn hide_window() {}
+    pub fn is_cursor_inside() -> bool {
+        true
+    }
+    pub fn place_cursor_inside() {}
+    pub fn start_window_drag() {}
+    pub fn focus_window() {}
 }
 
 pub struct ReaderApp {
@@ -136,10 +229,17 @@ pub struct ReaderApp {
     _current_hotkey: Option<HotKey>,
     pending_open: Option<PathBuf>,
     last_bounds_save: Instant,
+    /// 老板模式开关：与 UI 线程共享，由专用检测线程读取
+    auto_hide_enabled: Arc<AtomicBool>,
+    /// 启动时是否已把鼠标置入窗口
+    cursor_placed: bool,
+    /// 是否已做首帧初始化（置入鼠标/位置安全/日志）
+    first_frame_done: bool,
 }
 
 impl ReaderApp {
     pub fn new(cc: &eframe::CreationContext<'_>, config: Config) -> Self {
+        log::app_log("ReaderApp::new start");
         let available_fonts = fonts::available_chinese_fonts();
         {
             let mut fonts = egui::FontDefinitions::default();
@@ -163,6 +263,33 @@ impl ReaderApp {
                 while let Ok(ev) = rx.recv() {
                     if ev.state == global_hotkey::HotKeyState::Pressed {
                         win32::toggle_window();
+                    }
+                }
+            });
+        }
+
+        // 老板模式（鼠标离开窗口自动隐藏）：
+        // 与老板键同理，隐藏窗口后 eframe 事件循环会睡死、update() 不执行，
+        // 因此不能靠帧循环轮询，改用专用线程每 150ms 采样一次鼠标位置。
+        // 连续 2 次检测到鼠标移出窗口才隐藏，避免瞬态抖动误触发。
+        let auto_hide_enabled = Arc::new(AtomicBool::new(config.auto_hide_on_mouse_leave));
+        {
+            let enabled = auto_hide_enabled.clone();
+            std::thread::spawn(move || {
+                let mut consecutive_out = 0u32;
+                loop {
+                    std::thread::sleep(Duration::from_millis(150));
+                    if !enabled.load(Ordering::SeqCst) {
+                        consecutive_out = 0;
+                        continue;
+                    }
+                    if win32::is_cursor_inside() {
+                        consecutive_out = 0;
+                    } else {
+                        consecutive_out += 1;
+                        if consecutive_out >= 2 {
+                            win32::hide_window();
+                        }
                     }
                 }
             });
@@ -196,6 +323,9 @@ impl ReaderApp {
             _current_hotkey: current_hotkey,
             pending_open: None,
             last_bounds_save: Instant::now(),
+            auto_hide_enabled,
+            cursor_placed: false,
+            first_frame_done: false,
         };
 
         // 默认使用系统中文字体（若有）
@@ -213,6 +343,7 @@ impl ReaderApp {
             }
         }
 
+        log::app_log("ReaderApp::new done");
         app
     }
 
@@ -505,6 +636,36 @@ impl eframe::App for ReaderApp {
             self.load_file(&p);
         }
 
+        // 首帧初始化：置入鼠标 + 窗口位置安全 + 记录日志
+        if !self.first_frame_done {
+            self.first_frame_done = true;
+            // 强制让窗口获得焦点，避免首次拖动/缩放被“先聚焦窗口”吞掉
+            win32::focus_window();
+            log::app_log(&format!(
+                "first frame: screen={:?} outer={:?} monitor={:?}",
+                ctx.screen_rect(),
+                ctx.input(|i| i.viewport().outer_rect),
+                ctx.input(|i| i.viewport().monitor_size),
+            ));
+            if self.config.auto_hide_on_mouse_leave {
+                win32::place_cursor_inside();
+            }
+            // 老板模式下先把鼠标置入窗口（配合“鼠标离开自动隐藏”）
+            self.cursor_placed = true;
+            // 无边框窗口若恢复到屏幕外的旧位置，会表现为“双击没反应”，这里拉回可见区域
+            let (outer, monitor) =
+                ctx.input(|i| (i.viewport().outer_rect, i.viewport().monitor_size));
+            if let (Some(o), Some(ms)) = (outer, monitor) {
+                if ms.x > 100.0 && ms.y > 100.0 {
+                    let mon = egui::Rect::from_min_size(Pos2::ZERO, ms);
+                    if !o.intersects(mon) {
+                        log::app_log("window off-screen -> move to (30,30)");
+                        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::Pos2::new(30.0, 30.0)));
+                    }
+                }
+            }
+        }
+
         // 自动翻页
         if self.auto_running {
             if let Some(last) = self.auto_last_tick {
@@ -527,6 +688,17 @@ impl eframe::App for ReaderApp {
         });
         if let Some(p) = dropped.first() {
             self.load_file(p);
+        }
+
+        // ESC：菜单/目录打开时先关闭，否则退出程序
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if self.menu_open {
+                self.menu_open = false;
+            } else if self.toc_open {
+                self.toc_open = false;
+            } else {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
         }
 
         // 标题栏
@@ -575,7 +747,26 @@ impl eframe::App for ReaderApp {
 impl ReaderApp {
     fn reader_page_height(&self, ctx: &egui::Context) -> f32 {
         let screen = ctx.screen_rect();
-        (screen.height() - TITLEBAR_H - 60.0).max(40.0)
+        (screen.height() - self.titlebar_h() - 60.0).max(40.0)
+    }
+
+    /// 当前标题栏高度（隐藏时为 0）
+    fn titlebar_h(&self) -> f32 {
+        if self.config.show_titlebar {
+            TITLEBAR_H
+        } else {
+            0.0
+        }
+    }
+
+    /// 当前正在阅读的章节名（取目录中最后一个偏移不超过当前阅读位置的章节）
+    fn current_chapter(&self) -> Option<&str> {
+        let cur = self.cur_start();
+        self.toc
+            .iter()
+            .rev()
+            .find(|t| t.offset <= cur)
+            .map(|t| t.title.as_str())
     }
 
     fn reader_max_width(&self, ctx: &egui::Context) -> f32 {
@@ -596,6 +787,20 @@ impl ReaderApp {
     }
 
     fn draw_titlebar(&mut self, ctx: &egui::Context) {
+        if !self.config.show_titlebar {
+            return;
+        }
+        // 标题栏主文案：优先显示当前章节名，未识别到章节时回退为文件名
+        let title: String = self
+            .current_chapter()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| {
+                if self.file_name.is_empty() {
+                    "未打开文件".to_string()
+                } else {
+                    self.file_name.clone()
+                }
+            });
         egui::Area::new(egui::Id::new("titlebar"))
             .fixed_pos(Pos2::new(0.0, 0.0))
             .order(egui::Order::Foreground)
@@ -624,15 +829,11 @@ impl ReaderApp {
                         }
 
                         ui.add_space(8.0);
-                        let fname = if self.file_name.is_empty() {
-                            "未打开文件".to_string()
-                        } else {
-                            self.file_name.clone()
-                        };
                         ui.label(
-                            egui::RichText::new(&fname)
+                            egui::RichText::new(&title)
                                 .size(13.0)
-                                .color(Color32::from_rgb(0x7a, 0x6f, 0x5a)),
+                                .strong()
+                                .color(Color32::from_rgb(0x3e, 0x6b, 0x57)),
                         );
 
                         ui.add_space(12.0);
@@ -728,20 +929,19 @@ impl ReaderApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(self.bg))
             .show(ctx, |ui| {
-                ui.add_space(TITLEBAR_H);
+                ui.add_space(self.titlebar_h());
                 let avail = ui.available_rect_before_wrap();
                 let left = avail.left() + 30.0;
                 let top = avail.top() + 24.0;
                 let content_w = (avail.width() - 60.0).max(100.0);
                 let content_h = (avail.height() - 48.0).max(40.0);
+                let tb_h = self.titlebar_h();
 
-                // 点击翻页（在借用 self.text 之前处理，避免借用冲突）
-                // 菜单/目录打开期间不响应全局点击，否则点击菜单里的下拉框等控件
-                // 会被这里当作“点中间区域翻页/开关菜单”而误关菜单
+                // 左键点击：左/右 1/3 翻页；中间 1/3 为窗口拖动区，不做翻页
                 let click = if !self.menu_open && !self.toc_open {
                     ctx.input(|i| {
-                        if i.pointer.any_click() {
-                            i.pointer.hover_pos()
+                        if i.pointer.primary_clicked() {
+                            i.pointer.interact_pos()
                         } else {
                             None
                         }
@@ -750,17 +950,47 @@ impl ReaderApp {
                     None
                 };
                 if let Some(pos) = click {
-                    if pos.y > TITLEBAR_H && pos.y < avail.bottom() {
+                    if pos.y > tb_h && pos.y < avail.bottom() {
                         let rel_x = pos.x - left;
                         if rel_x >= 0.0 && rel_x <= content_w {
                             if rel_x < content_w / 3.0 {
                                 self.prev_page(ctx, max_width, page_height);
-                            } else if rel_x < content_w * 2.0 / 3.0 {
-                                self.menu_open = !self.menu_open;
-                            } else {
+                            } else if rel_x >= content_w * 2.0 / 3.0 {
                                 self.next_page(ctx, max_width, page_height);
                             }
+                            // 中间 1/3：留给左键拖动窗口
                         }
+                    }
+                }
+
+                // 右键点击阅读区任意位置：开关设置菜单
+                let rclick = if !self.menu_open && !self.toc_open {
+                    ctx.input(|i| {
+                        if i.pointer.secondary_clicked() {
+                            i.pointer.interact_pos()
+                        } else {
+                            None
+                        }
+                    })
+                } else {
+                    None
+                };
+                if let Some(pos) = rclick {
+                    if pos.y > tb_h && pos.y < avail.bottom() {
+                        self.menu_open = !self.menu_open;
+                    }
+                }
+
+                // 中间 1/3 左键拖动：无边框模式下拖动整个窗口
+                if !self.menu_open && !self.toc_open {
+                    let drag_rect = egui::Rect::from_min_size(
+                        Pos2::new(left + content_w / 3.0, top),
+                        Vec2::new(content_w / 3.0, content_h),
+                    );
+                    let drag_resp =
+                        ui.interact(drag_rect, ui.id().with("win_drag"), egui::Sense::drag());
+                    if drag_resp.drag_started() {
+                        win32::start_window_drag();
                     }
                 }
 
@@ -823,6 +1053,40 @@ impl ReaderApp {
                         FontId::new(12.0, FontFamily::Proportional),
                         Color32::from_rgb(0xfd, 0xfa, 0xf1),
                     );
+                }
+            });
+
+        // 无边框模式下右下角缩放柄：拖动可调整窗口大小
+        self.draw_resize_grip(ctx);
+    }
+
+    /// 右下角缩放柄（无边框窗口调整大小用）
+    fn draw_resize_grip(&mut self, ctx: &egui::Context) {
+        let screen = ctx.screen_rect();
+        let size = 20.0;
+        let grip_pos = Pos2::new(screen.right() - size, screen.bottom() - size);
+        egui::Area::new(egui::Id::new("resize_grip"))
+            .fixed_pos(grip_pos)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                let resp = ui.allocate_response(Vec2::new(size, size), egui::Sense::drag());
+                let rect = resp.rect;
+                // 右下角小三角，提示可拖动
+                ui.painter().add(egui::Shape::convex_polygon(
+                    vec![
+                        Pos2::new(rect.right() - 14.0, rect.bottom()),
+                        Pos2::new(rect.right(), rect.bottom()),
+                        Pos2::new(rect.right(), rect.bottom() - 14.0),
+                    ],
+                    Color32::from_rgba_unmultiplied(0x3e, 0x6b, 0x57, 120),
+                    egui::Stroke::NONE,
+                ));
+                // 用 egui 原生 BeginResize（→ winit 正规缩放路径），避免裸 SendMessage 模态循环导致的卡死
+                if resp.drag_started() {
+                    win32::focus_window();
+                    ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(
+                        egui::viewport::ResizeDirection::SouthEast,
+                    ));
                 }
             });
     }
@@ -947,26 +1211,30 @@ impl ReaderApp {
                             });
 
                             ui.horizontal(|ui| {
-                                ui.label("自动翻页");
+                                ui.label("翻页速度");
                                 ui.add_space(20.0);
-                                let secs = (self.auto_ms as f64 / 1000.0) as f32;
-                                let mut val = secs;
-                                egui::ComboBox::from_id_salt("auto_cb")
-                                    .selected_text(format!("{:.1}s", secs))
-                                    .show_ui(ui, |ui| {
-                                        for &s in &[0.2, 0.3, 0.5, 0.8, 1.0, 1.5, 2.0] {
-                                            ui.selectable_value(&mut val, s, format!("{:.1}s", s));
-                                        }
-                                    });
-                                self.auto_ms = (val * 1000.0) as u64;
+                                let mut secs = self.auto_ms as f32 / 1000.0;
+                                ui.add(egui::Slider::new(&mut secs, 0.2..=2.0).step_by(0.1));
+                                self.auto_ms = (secs * 1000.0).round() as u64;
+                                ui.label(format!("{:.1}s", secs));
                                 ui.label(if self.auto_running { "运行中" } else { "已停止" });
-                                self.save_progress();
+                                if ui.input(|i| i.pointer.any_released()) {
+                                    self.save_progress();
+                                }
                             });
                             ui.label(
                                 egui::RichText::new("空格键 启动/停止，每次上移一行")
                                     .size(11.0)
                                     .color(Color32::from_rgb(0x7a, 0x6f, 0x5a)),
                             );
+
+                            ui.horizontal(|ui| {
+                                ui.label("文件");
+                                ui.add_space(20.0);
+                                if ui.button("打开 TXT 文件").clicked() {
+                                    self.open_file_dialog();
+                                }
+                            });
 
                             ui.horizontal(|ui| {
                                 ui.label("目录");
@@ -1005,14 +1273,32 @@ impl ReaderApp {
                             });
 
                             ui.horizontal(|ui| {
-                                ui.label("最小窗口");
+                                ui.label("老板模式");
                                 ui.add_space(20.0);
-                                ui.add(egui::DragValue::new(&mut self.config.min_width).range(100.0..=800.0));
-                                ui.label("×");
-                                ui.add(egui::DragValue::new(&mut self.config.min_height).range(80.0..=600.0));
+                                let mut chk = self.config.auto_hide_on_mouse_leave;
+                                if ui
+                                    .checkbox(&mut chk, "鼠标离开窗口自动隐藏")
+                                    .changed()
+                                {
+                                    self.config.auto_hide_on_mouse_leave = chk;
+                                    self.auto_hide_enabled.store(chk, Ordering::SeqCst);
+                                }
                             });
                             ui.label(
-                                egui::RichText::new("允许窗口缩到极小，突破浏览器限制")
+                                egui::RichText::new(
+                                    "开启后鼠标移出阅读界面将触发老板键隐藏；再次按 Alt+Z 唤回",
+                                )
+                                .size(11.0)
+                                .color(Color32::from_rgb(0x7a, 0x6f, 0x5a)),
+                            );
+
+                            ui.horizontal(|ui| {
+                                ui.label("标题栏");
+                                ui.add_space(20.0);
+                                ui.checkbox(&mut self.config.show_titlebar, "显示顶部标题栏");
+                            });
+                            ui.label(
+                                egui::RichText::new("隐藏后窗口更简洁，仍可右键打开本菜单、中间拖动窗口")
                                     .size(11.0)
                                     .color(Color32::from_rgb(0x7a, 0x6f, 0x5a)),
                             );
@@ -1101,10 +1387,6 @@ impl ReaderApp {
                             });
                     });
             });
-
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.toc_open = false;
-        }
     }
 
     fn draw_toast(&mut self, ctx: &egui::Context) {
