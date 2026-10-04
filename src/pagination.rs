@@ -57,6 +57,7 @@ pub fn estimate_chars_at(
     page_height: f32,
     font_family: &FontFamily,
 ) -> usize {
+    let t = floor_char_boundary(text, t);
     let remaining = text.len().saturating_sub(t);
     if remaining == 0 {
         return 0;
@@ -81,6 +82,7 @@ pub fn page_end_at(
     page_height: f32,
     font_family: &FontFamily,
 ) -> usize {
+    let start = floor_char_boundary(text, start);
     let remaining = text.len().saturating_sub(start);
     if remaining == 0 {
         return 0;
@@ -176,6 +178,7 @@ pub fn line_end_at(
     max_width: f32,
     font_family: &FontFamily,
 ) -> usize {
+    let start = floor_char_boundary(text, start);
     let remaining = text.len().saturating_sub(start);
     if remaining == 0 {
         return start;

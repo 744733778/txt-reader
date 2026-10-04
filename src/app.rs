@@ -6,7 +6,7 @@ use crate::toc::{ChapterMatcher, TocItem};
 use eframe::egui;
 use egui::{Color32, FontFamily, FontId, Pos2, Vec2};
 use global_hotkey::hotkey::HotKey;
-use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager};
+use global_hotkey::GlobalHotKeyManager;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -48,6 +48,7 @@ fn parse_hotkey(s: &str) -> Option<HotKey> {
 // ---------------------------------------------------------------------------
 #[cfg(target_os = "windows")]
 mod win32 {
+    use global_hotkey::GlobalHotKeyEvent;
     use std::sync::atomic::{AtomicIsize, Ordering};
 
     const SW_HIDE: i32 = 0;
@@ -69,6 +70,17 @@ mod win32 {
         bottom: i32,
     }
 
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct MSG {
+        hwnd: isize,
+        message: u32,
+        w_param: isize,
+        l_param: isize,
+        time: u32,
+        pt: POINT,
+    }
+
     #[link(name = "user32")]
     extern "system" {
         fn IsWindowVisible(h_wnd: isize) -> i32;
@@ -86,46 +98,143 @@ mod win32 {
         fn ReleaseCapture() -> i32;
         fn SendMessageW(h_wnd: isize, msg: u32, w_param: isize, l_param: isize) -> isize;
         fn BringWindowToTop(h_wnd: isize) -> i32;
+        fn GetForegroundWindow() -> isize;
+        fn GetCurrentThreadId() -> u32;
+        fn AttachThreadInput(id_attach: u32, id_attach_to: u32, f_attach: i32) -> i32;
+        fn IsWindow(h_wnd: isize) -> i32;
+        fn GetMessageW(lp_msg: *mut MSG, h_wnd: isize, w_msg_filter_min: u32, w_msg_filter_max: u32) -> i32;
+        fn TranslateMessage(lp_msg: *const MSG) -> i32;
+        fn DispatchMessageW(lp_msg: *const MSG) -> isize;
+        fn PostMessageW(h_wnd: isize, msg: u32, w_param: isize, l_param: isize) -> i32;
+        fn SetWindowPos(h_wnd: isize, h_wnd_insert_after: isize, x: i32, y: i32, cx: i32, cy: i32, flags: u32) -> i32;
+        fn GetAsyncKeyState(v_key: i32) -> i16;
     }
 
     const WM_NCLBUTTONDOWN: u32 = 0x00A1;
     const HTCAPTION: isize = 0x0002;
+    const WM_NULL: u32 = 0x0000;
+    const WM_MOUSEMOVE: u32 = 0x0200;
+    const SWP_NOSIZE: u32 = 0x0001;
+    const SWP_NOZORDER: u32 = 0x0004;
+    const SWP_NOACTIVATE: u32 = 0x0010;
+    const VK_LBUTTON: i32 = 0x01;
 
     static FOUND_HWND: AtomicIsize = AtomicIsize::new(0);
 
-    unsafe extern "system" fn enum_cb(h_wnd: isize, l_param: isize) -> i32 {
-        let mut pid: u32 = 0;
-        unsafe { GetWindowThreadProcessId(h_wnd, &mut pid) };
-        if pid as isize == l_param {
-            FOUND_HWND.store(h_wnd, Ordering::SeqCst);
-            return 0; // 停止枚举
-        }
-        1
+    /// 枚举时的收集状态（通过 l_param 传入回调）。
+    /// 本进程存在两个顶层窗口：主阅读窗口（大尺寸）与全局热键辅助窗口（(0,0) 极小）。
+    /// 必须按“面积最大”选取主窗口——按 Z 序第一个可见窗口会捡到辅助窗口，
+    /// 导致拖动/老板键/聚焦全部操作在辅助窗口上（表现为全部失效）。
+    #[repr(C)]
+    struct FindState {
+        target_pid: isize,
+        best_visible: isize,
+        best_visible_area: i64,
+        best_any: isize,
+        best_any_area: i64,
     }
 
-    /// 通过进程 ID 找到本应用的主窗口句柄（隐藏窗口同样会被枚举到）
+    unsafe extern "system" fn enum_cb(h_wnd: isize, l_param: isize) -> i32 {
+        let st = &mut *(l_param as *mut FindState);
+        let mut pid: u32 = 0;
+        unsafe { GetWindowThreadProcessId(h_wnd, &mut pid) };
+        if pid as isize == st.target_pid {
+            let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+            if unsafe { GetWindowRect(h_wnd, &mut r) } != 0 {
+                let w = (r.right - r.left).max(0) as i64;
+                let h = (r.bottom - r.top).max(0) as i64;
+                let area = w * h;
+                if area > st.best_any_area {
+                    st.best_any = h_wnd;
+                    st.best_any_area = area;
+                }
+                if IsWindowVisible(h_wnd) != 0 && area > st.best_visible_area {
+                    st.best_visible = h_wnd;
+                    st.best_visible_area = area;
+                }
+            }
+        }
+        1 // 继续扫描：需要面积最大，不能提前停止
+    }
+
+    /// 通过进程 ID 找到本应用的主窗口句柄：取“面积最大”的窗口
+    /// （主阅读窗口 ~733x821，辅助窗口极小），可见者优先并缓存。
+    /// 全部隐藏时返回面积最大的窗口但不缓存（下次重新枚举）。
+    /// 面积阈值 20000 排除极小辅助窗口。
     fn find_window() -> Option<isize> {
-        FOUND_HWND.store(0, Ordering::SeqCst);
+        let cached = FOUND_HWND.load(Ordering::SeqCst);
+        if cached != 0 && unsafe { IsWindow(cached) } != 0 {
+            return Some(cached);
+        }
+        let mut st = FindState {
+            target_pid: std::process::id() as isize,
+            best_visible: 0,
+            best_visible_area: 0,
+            best_any: 0,
+            best_any_area: 0,
+        };
         unsafe {
-            EnumWindows(Some(enum_cb), std::process::id() as isize);
+            EnumWindows(Some(enum_cb), &mut st as *mut FindState as isize);
         }
-        let h = FOUND_HWND.load(Ordering::SeqCst);
-        if h == 0 {
-            None
+        let result = if st.best_visible_area >= 20_000 {
+            FOUND_HWND.store(st.best_visible, Ordering::SeqCst);
+            Some(st.best_visible)
+        } else if st.best_any_area >= 20_000 {
+            // 主窗口当前隐藏：返回但不缓存，下次重新枚举
+            Some(st.best_any)
         } else {
-            Some(h)
-        }
+            None
+        };
+        crate::log::app_log(&format!(
+            "find_window: vis=({:x},{}px) any=({:x},{}px) result={}",
+            st.best_visible,
+            st.best_visible_area,
+            st.best_any,
+            st.best_any_area,
+            match result {
+                Some(h) => format!("Some({:x})", h),
+                None => "None".to_string(),
+            }
+        ));
+        result
     }
 
     /// 切换窗口可见状态：隐藏 ⇄ 显示
     pub fn toggle_window() {
-        let Some(h) = find_window() else { return };
+        let Some(h) = find_window() else {
+            crate::log::app_log("toggle_window: find_window returned None");
+            return;
+        };
         unsafe {
-            if IsWindowVisible(h) != 0 {
+            let visible = IsWindowVisible(h) != 0;
+            crate::log::app_log(&format!(
+                "toggle_window: hwnd={:x} was_visible={} -> {}",
+                h,
+                visible,
+                if visible { "hide" } else { "show" }
+            ));
+            if visible {
                 ShowWindow(h, SW_HIDE);
             } else {
                 ShowWindow(h, SW_SHOW);
                 SetForegroundWindow(h);
+                // 可靠唤醒 UI 线程：WM_NULL 会被 winit 静默吞掉（不产生事件，
+                // eframe 不重绘、悬停聚焦不触发，表现为显示后需先单击才能用），
+                // WM_MOUSEMOVE 会让 winit 发出 CursorMoved -> eframe 运行 update()
+                // -> 悬停聚焦 + 重绘。用真实鼠标位置投递。
+                let mut pt = POINT { x: 0, y: 0 };
+                GetCursorPos(&mut pt);
+                PostMessageW(
+                    h,
+                    WM_MOUSEMOVE,
+                    0,
+                    ((((pt.y as i32) & 0xFFFF) << 16) | ((pt.x as i32) & 0xFFFF)) as isize,
+                );
+                crate::log::app_log(&format!(
+                    "boss show: vis={} fg={}",
+                    IsWindowVisible(h),
+                    if GetForegroundWindow() == h { 1 } else { 0 }
+                ));
             }
         }
     }
@@ -166,24 +275,131 @@ mod win32 {
         }
     }
 
-    /// 确保窗口获得焦点并置顶（首次点击可能只聚焦窗口，导致第一次拖动被吞）
-    pub fn focus_window() {
-        if let Some(h) = find_window() {
-            unsafe {
-                SetForegroundWindow(h);
-                BringWindowToTop(h);
+    /// 光标是否位于“可见”窗口内（用于悬停聚焦）。
+    /// 窗口已隐藏时一律返回 false，避免对隐藏窗口抢焦点。
+    pub fn cursor_over_visible_window() -> bool {
+        let Some(h) = find_window() else { return false };
+        unsafe {
+            if IsWindowVisible(h) == 0 {
+                return false;
+            }
+            let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+            GetWindowRect(h, &mut r);
+            let mut p = POINT { x: 0, y: 0 };
+            GetCursorPos(&mut p);
+            PtInRect(&r, p) != 0
+        }
+    }
+
+    /// 主窗口当前是否可见（用于拖动延续判断：隐藏时立即终止拖拽）
+    pub fn is_visible() -> bool {
+        let Some(h) = find_window() else { return false };
+        unsafe { IsWindowVisible(h) != 0 }
+    }
+
+    /// 专用热键消息泵：阻塞处理本线程队列消息。
+    /// GlobalHotKeyManager 创建的消息窗口属于本线程，RegisterHotKey 的 WM_HOTKEY
+    /// 会投递到本线程队列，必须由本线程 GetMessageW 泵出并派发到 global_hotkey_proc，
+    /// 热键事件才会进入通道。主线程睡死与此泵无关。
+    pub fn pump_hotkey_messages() {
+        // 事件通道唯一消费者在本线程：派发（WM_HOTKEY→通道）与消费（→toggle_window）
+        // 同线程完成，无跨线程依赖、无额外线程可死。窗口隐藏不影响本泵。
+        let rx = GlobalHotKeyEvent::receiver().clone();
+        // 200ms 防抖：Windows 按住热键时 WM_HOTKEY 会重复触发，
+        // 一次按键若双发会导致"隐藏后立刻又显示"（表现为老板键失效）。
+        let mut last_toggle = std::time::Instant::now() - std::time::Duration::from_millis(500);
+        unsafe {
+            let mut msg: MSG = std::mem::zeroed();
+            loop {
+                let ret = GetMessageW(&mut msg, 0, 0, 0);
+                if ret > 0 {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                } else {
+                    // ret<=0（错误或 WM_QUIT）：短暂重试，保持热键存活直到进程退出
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                while let Ok(ev) = rx.try_recv() {
+                    if ev.state == global_hotkey::HotKeyState::Pressed {
+                        let now = std::time::Instant::now();
+                        if now.duration_since(last_toggle) < std::time::Duration::from_millis(200) {
+                            crate::log::app_log("boss hotkey: debounced double-fire");
+                            continue;
+                        }
+                        last_toggle = now;
+                        crate::log::app_log("boss hotkey Alt+Z triggered");
+                        toggle_window();
+                    }
+                }
             }
         }
     }
 
-    /// 无边框模式拖动窗口：先聚焦，再向系统发送 WM_NCLBUTTONDOWN+HTCAPTION，
-    /// 让操作系统原生接管窗口移动（自定义标题栏的标准做法，可靠且无需手动算位置）。
-    pub fn start_window_drag() {
-        focus_window();
+    /// 确保窗口获得焦点并置顶。SetForegroundWindow 可能被前台锁拒绝，
+    /// 失败时附加到当前前台线程再试（经典 Workaround）。
+    pub fn focus_window() {
         let Some(h) = find_window() else { return };
         unsafe {
-            ReleaseCapture();
-            SendMessageW(h, WM_NCLBUTTONDOWN, HTCAPTION, 0);
+            if SetForegroundWindow(h) == 0 {
+                let fg = GetForegroundWindow();
+                if fg != 0 && fg != h {
+                    let cur = GetCurrentThreadId();
+                    let fg_tid = GetWindowThreadProcessId(fg, std::ptr::null_mut());
+                    if fg_tid != 0 && fg_tid != cur {
+                        AttachThreadInput(cur, fg_tid, 1);
+                        SetForegroundWindow(h);
+                        AttachThreadInput(cur, fg_tid, 0);
+                    }
+                }
+            }
+            BringWindowToTop(h);
+        }
+    }
+
+    /// 真实光标屏幕坐标（物理像素，与 SetWindowPos 同坐标系）
+    pub fn cursor_pos() -> Option<(i32, i32)> {
+        unsafe {
+            let mut pt = POINT { x: 0, y: 0 };
+            if GetCursorPos(&mut pt) == 0 {
+                None
+            } else {
+                Some((pt.x, pt.y))
+            }
+        }
+    }
+
+    /// 窗口左上角屏幕坐标（物理像素）
+    pub fn window_pos() -> Option<(i32, i32)> {
+        let Some(h) = find_window() else { return None };
+        unsafe {
+            let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+            if GetWindowRect(h, &mut r) == 0 {
+                return None;
+            }
+            Some((r.left, r.top))
+        }
+    }
+
+    /// 左键物理按下状态（GetAsyncKeyState，不依赖 egui 输入状态）
+    pub fn left_button_down() -> bool {
+        unsafe { GetAsyncKeyState(VK_LBUTTON) < 0 }
+    }
+
+    /// 窗口是否已是前台窗口（真实焦点，不依赖 egui 的 focused 状态）
+    pub fn is_foreground() -> bool {
+        let Some(h) = find_window() else { return false };
+        unsafe { GetForegroundWindow() == h }
+    }
+
+    /// 拖动期间同步移动窗口：SetWindowPos 立即落位（无异步队列延迟），
+    /// 参数为物理像素屏幕坐标。失败时记日志（供诊断）。
+    pub fn move_window_to_xy(x: i32, y: i32) {
+        let Some(h) = find_window() else { return };
+        unsafe {
+            let ret = SetWindowPos(h, 0, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            if ret == 0 {
+                crate::log::app_log(&format!("move_window_to_xy: SetWindowPos failed ({},{})", x, y));
+            }
         }
     }
 }
@@ -196,7 +412,25 @@ mod win32 {
         true
     }
     pub fn place_cursor_inside() {}
-    pub fn start_window_drag() {}
+    pub fn cursor_over_visible_window() -> bool {
+        false
+    }
+    pub fn is_visible() -> bool {
+        true
+    }
+    pub fn cursor_pos() -> Option<(i32, i32)> {
+        None
+    }
+    pub fn window_pos() -> Option<(i32, i32)> {
+        None
+    }
+    pub fn left_button_down() -> bool {
+        false
+    }
+    pub fn is_foreground() -> bool {
+        true
+    }
+    pub fn move_window_to_xy(_x: i32, _y: i32) {}
     pub fn focus_window() {}
 }
 
@@ -235,6 +469,10 @@ pub struct ReaderApp {
     cursor_placed: bool,
     /// 是否已做首帧初始化（置入鼠标/位置安全/日志）
     first_frame_done: bool,
+    /// 手动拖动窗口状态：是否正在拖动
+    drag_active: bool,
+    /// 手动拖动窗口状态：按下时鼠标相对窗口左上角的偏移
+    drag_offset: Vec2,
 }
 
 impl ReaderApp {
@@ -247,25 +485,31 @@ impl ReaderApp {
             cc.egui_ctx.set_fonts(fonts);
         }
 
-        let hotkey_manager = GlobalHotKeyManager::new().ok();
-        let current_hotkey = parse_hotkey(BOSS_KEY);
-        if let (Some(mgr), Some(hk)) = (&hotkey_manager, &current_hotkey) {
-            let _ = mgr.register(*hk);
-        }
-
-        // 老板键事件：由专用线程作为通道唯一消费者处理，直接调用 Win32 操作窗口。
-        // 原因：eframe 只在 RedrawRequested 时运行帧，隐藏窗口收不到 WM_PAINT，
-        // 事件循环会睡死，通道事件若只靠 update() 轮询将永远无法处理
-        // （表现：老板键隐藏窗口后无法唤回）。
+        // 老板键热键注册：GlobalHotKeyManager 必须创建在“运行事件循环的线程”上，
+        // WM_HOTKEY 由该线程的消息泵分发到 global_hotkey_proc。若建在主线程，
+        // 主窗口隐藏后 eframe/winit 事件循环睡死、不再泵消息，Alt+Z 将不再送达
+        // （实测表现：老板键隐藏后无法再次唤回）。
+        // 因此改在专用线程创建管理器 + 注册热键 + 独立 GetMessageW 消息泵，与主线程解耦。
         {
-            let rx = GlobalHotKeyEvent::receiver().clone();
-            std::thread::spawn(move || {
-                while let Ok(ev) = rx.recv() {
-                    if ev.state == global_hotkey::HotKeyState::Pressed {
-                        win32::toggle_window();
+            std::thread::Builder::new()
+                .name("hotkey-pump".to_string())
+                .spawn(move || {
+                    let Ok(mgr) = GlobalHotKeyManager::new() else {
+                        crate::log::app_log("hotkey: GlobalHotKeyManager::new failed");
+                        return;
+                    };
+                    let Some(hk) = parse_hotkey(BOSS_KEY) else {
+                        crate::log::app_log("hotkey: parse BOSS_KEY failed");
+                        return;
+                    };
+                    if let Err(e) = mgr.register(hk) {
+                        crate::log::app_log(&format!("hotkey: register failed {:?}", e));
+                        return;
                     }
-                }
-            });
+                    crate::log::app_log("hotkey pump thread running (Alt+Z)");
+                    win32::pump_hotkey_messages();
+                })
+                .ok();
         }
 
         // 老板模式（鼠标离开窗口自动隐藏）：
@@ -319,13 +563,15 @@ impl ReaderApp {
             toc: Vec::new(),
             chapter_matcher: ChapterMatcher::new(),
             available_fonts,
-            _hotkey_manager: hotkey_manager,
-            _current_hotkey: current_hotkey,
+            _hotkey_manager: None,
+            _current_hotkey: None,
             pending_open: None,
             last_bounds_save: Instant::now(),
             auto_hide_enabled,
             cursor_placed: false,
             first_frame_done: false,
+            drag_active: false,
+            drag_offset: Vec2::ZERO,
         };
 
         // 默认使用系统中文字体（若有）
@@ -666,6 +912,15 @@ impl eframe::App for ReaderApp {
             }
         }
 
+        // 悬停聚焦：用裸 Win32 判断“窗口不是前台”+“光标在窗口内”再抢焦点。
+        // 不依赖 egui 的 focused（该状态会陈旧为 true 导致永不聚焦——表现为
+        // ESC/右键每次都要先单击）。窗口隐藏时 cursor_over_visible_window 返回 false。
+        if win32::cursor_over_visible_window() && !win32::is_foreground() {
+            crate::log::app_log("hover-focus: cursor in window & not foreground -> focus_window()");
+            win32::focus_window();
+        }
+
+
         // 自动翻页
         if self.auto_running {
             if let Some(last) = self.auto_last_tick {
@@ -691,7 +946,16 @@ impl eframe::App for ReaderApp {
         }
 
         // ESC：菜单/目录打开时先关闭，否则退出程序
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        if esc {
+            crate::log::app_log(&format!(
+                "esc key event: menu={} toc={} fg={}",
+                self.menu_open,
+                self.toc_open,
+                win32::is_foreground()
+            ));
+        }
+        if esc {
             if self.menu_open {
                 self.menu_open = false;
             } else if self.toc_open {
@@ -837,8 +1101,16 @@ impl ReaderApp {
                         );
 
                         ui.add_space(12.0);
-                        if ui.add(egui::Button::new("老板键").min_size(Vec2::new(60.0, 26.0))).clicked() {
-                            win32::toggle_window();
+                        // 原老板键按钮位置：显示当前文件名（超长截断，避免挤压右侧进度）
+                        if !self.file_name.is_empty() {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&self.file_name)
+                                        .size(12.0)
+                                        .color(Color32::from_rgb(0x7a, 0x6f, 0x5a)),
+                                )
+                                .truncate(),
+                            );
                         }
                         ui.add_space(8.0);
                         let pct = if self.total() > 0 {
@@ -990,7 +1262,40 @@ impl ReaderApp {
                     let drag_resp =
                         ui.interact(drag_rect, ui.id().with("win_drag"), egui::Sense::drag());
                     if drag_resp.drag_started() {
-                        win32::start_window_drag();
+                        // 偏移量用裸 Win32 坐标（物理像素，与 SetWindowPos 同坐标系），
+                        // 不依赖 egui 的 interact_pos / outer_rect（逻辑坐标，DPI 缩放时错位）。
+                        let (cp, wp) = (win32::cursor_pos(), win32::window_pos());
+                        if let (Some((cx, cy)), Some((wx, wy))) = (cp, wp) {
+                            self.drag_offset = Vec2::new(cx as f32 - wx as f32, cy as f32 - wy as f32);
+                        }
+                        self.drag_active = true;
+                        crate::log::app_log(&format!(
+                            "drag start: cur={:?} win={:?} off=({:.0},{:.0})",
+                            cp, wp, self.drag_offset.x, self.drag_offset.y
+                        ));
+                    }
+                    if self.drag_active {
+                        // 延续用裸 Win32 物理按键状态（GetAsyncKeyState 反映真实按键）。
+                        let down = win32::left_button_down();
+                        let vis = win32::is_visible();
+                        let cur = win32::cursor_pos();
+                        if down && vis {
+                            if let Some((cx, cy)) = cur {
+                                win32::move_window_to_xy(
+                                    (cx as f32 - self.drag_offset.x).round() as i32,
+                                    (cy as f32 - self.drag_offset.y).round() as i32,
+                                );
+                            }
+                            // 保证拖动期间每帧都执行 update（否则窗口移动后无事件驱动重绘）
+                            ctx.request_repaint();
+                        } else {
+                            self.drag_active = false;
+                            crate::log::app_log(&format!(
+                                "drag end: down={} vis={} cur={:?}",
+                                down, vis, cur
+                            ));
+                            win32::focus_window();
+                        }
                     }
                 }
 
