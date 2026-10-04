@@ -4,6 +4,7 @@
 mod app;
 mod config;
 mod fonts;
+mod log;
 mod pagination;
 mod toc;
 
@@ -12,12 +13,30 @@ use config::Config;
 use eframe::egui;
 
 fn main() -> eframe::Result<()> {
+    // 记录静默启动失败/崩溃（GUI 子系统无控制台，肉眼看不到错误）
+    std::panic::set_hook(Box::new(|info| {
+        log::app_log(&format!("PANIC: {}", info));
+    }));
+    log::app_log(&format!(
+        "app start (config={})",
+        Config::path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "?/path".into())
+    ));
+
     let config = Config::load();
+    log::app_log(&format!(
+        "config loaded: {}x{} pos={:?} titlebar={} borderless",
+        config.window_width,
+        config.window_height,
+        (config.window_x, config.window_y),
+        config.show_titlebar,
+    ));
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([config.window_width, config.window_height])
         .with_min_inner_size([config.min_width, config.min_height])
-        .with_decorations(true) // 原生窗口装饰：系统级拖动与边框缩放
+        .with_decorations(false) // 无边框：去掉原生标题栏（最小化/最大化/关闭按钮）
         .with_title("TXT 阅读器");
 
     if config.always_on_top {
@@ -35,7 +54,8 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
-    eframe::run_native(
+    log::app_log("before run_native");
+    let result = eframe::run_native(
         "TXT 阅读器",
         native_options,
         Box::new(|cc| {
@@ -54,7 +74,14 @@ fn main() -> eframe::Result<()> {
             visuals.hyperlink_color = Color32::from_rgb(0x3e, 0x6b, 0x57);
             cc.egui_ctx.set_visuals(visuals);
 
+            log::app_log("app creation callback invoked");
             Ok(Box::new(ReaderApp::new(cc, config)))
         }),
-    )
+    );
+
+    match &result {
+        Ok(()) => log::app_log("run_native returned Ok (窗口正常关闭)"),
+        Err(e) => log::app_log(&format!("run_native ERROR: {:?}", e)),
+    }
+    result
 }
