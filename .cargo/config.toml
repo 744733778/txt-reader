@@ -6,15 +6,31 @@
 #    （Windows 上用 MSVC 工具链时，本文件 x86_64-pc-windows-gnu 段不生效，
 #      不会干扰你的编译；不会走 build-std，稳定版可直接编译。）
 #
-# 2) 需要在 Windows 7 上运行（需 nightly + 重新编译标准库）：
+# 2) 需要在 Windows 7 上运行（已验证，2026-10）：
+#    Win7 报错"无法定位程序输入点 GetSystemTimePreciseAsFileTime 于 KERNEL32.dll"
+#    的根因：标准库 SystemTime::now() 在普通 Windows 目标（target_vendor="pc"）
+#    下会静态导入 GetSystemTimePreciseAsFileTime（Win8+ 才有），Win7 启动即失败。
+#    修复：用 target_vendor="win7" 重新编译标准库（std 内置回退到 Win7 就有的
+#    GetSystemTimeAsFileTime），生成不导入任何 Win8+ API 的 EXE。
+#    步骤：
 #       rustup toolchain install nightly
 #       rustup component add rust-src --toolchain nightly
 #       rustup target add x86_64-pc-windows-gnu --toolchain nightly
-#       cargo +nightly build --release -Z build-std=std,panic_abort \
-#           --target x86_64-pc-windows-gnu
-#    target_vendor="win7" 会启用标准库内建的 Win7 兼容回退，避免引入
-#    Windows 8/10 才有的 API（GetSystemTimePreciseAsFileTime、WaitOnAddress、
-#    ProcessPrng），从而保证生成的 EXE 能在 Windows 7 上运行。
+#       cargo +nightly build --release -Z build-std=std --target x86_64-pc-windows-gnu
+#    注意：
+#    - 本文件 [target.x86_64-pc-windows-gnu] 段的 rustflags 已带
+#      --cfg target_vendor="win7"（配合 -A explicit_builtin_cfgs_in_flags），
+#      build-std 编译 std 时自动启用 Win7 回退，无需额外参数。
+#    - 不要写 -Z build-std=std,panic_abort：Cargo.toml 的 profile 是 panic="unwind"，
+#      写 panic_abort 会与 unwind 冲突；直接 -Z build-std=std 即可。
+#    - 验证 EXE 是否兼容 Win7（objdump 查导入表，不应出现以下符号）：
+#      x86_64-w64-mingw32-objdump -p txt-reader-rs.exe | grep -iE \
+#        "GetSystemTimePreciseAsFileTime|WaitOnAddress|ProcessPrng|SetThreadDescription"
+#    - 备选：官方 Win7 目标（rustc 内置 x86_64-win7-windows-gnu，Tier 3）同样可编译，
+#      但 windows_x86_64_gnu-0.48.5 等旧 crate 的 build.rs 有目标白名单
+#      （只认 x86_64-pc-windows-gnu），需手动 -L 补 import lib 路径，
+#      且 llvm-mingw 需为 -lgcc/-lgcc_eh 建别名（libgcc.a->compiler-rt、libgcc_eh.a->libunwind）。
+#      日常推荐用上面的 pc + target_vendor 方案。
 # ---------------------------------------------------------------------------
 
 [target.x86_64-pc-windows-gnu]
