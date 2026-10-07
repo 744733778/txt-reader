@@ -6,7 +6,10 @@ use crate::toc::{ChapterMatcher, TocItem};
 use eframe::egui;
 use egui::{Color32, FontFamily, FontId, Pos2, Vec2};
 use global_hotkey::hotkey::HotKey;
-use global_hotkey::GlobalHotKeyManager;
+use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager};
+// Linux autohide 需从 eframe Frame 取 winit 原生窗口句柄（X11 Window id）
+#[cfg(target_os = "linux")]
+use raw_window_handle::HasWindowHandle;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -402,16 +405,130 @@ mod win32 {
             }
         }
     }
+
+    /// 检测 Windows 7（6.1）：GetVersionExW 在 Win7 上始终返回真实版本 6.1
+    ///（manifest 遮蔽只影响 Win8.1+，不影响我们判断"是否 Win7"）。
+    /// 用于字体策略：Win7 的 GDI 渲染下，中英文字体混排基线错位明显，
+    /// 需让全部字符使用同一中文字体渲染。
+    pub fn is_windows7() -> bool {
+        #[repr(C)]
+        struct OSVERSIONINFOEXW {
+            dw_os_version_info_size: u32,
+            dw_major_version: u32,
+            dw_minor_version: u32,
+            dw_build_number: u32,
+            dw_platform_id: u32,
+            sz_csd_version: [u16; 128],
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetVersionExW(lp_version_information: *mut OSVERSIONINFOEXW) -> i32;
+        }
+        let mut vi = OSVERSIONINFOEXW {
+            dw_os_version_info_size: std::mem::size_of::<OSVERSIONINFOEXW>() as u32,
+            dw_major_version: 0,
+            dw_minor_version: 0,
+            dw_build_number: 0,
+            dw_platform_id: 0,
+            sz_csd_version: [0; 128],
+        };
+        unsafe {
+            if GetVersionExW(&mut vi) == 0 {
+                return false;
+            }
+            vi.dw_major_version == 6 && vi.dw_minor_version == 1
+        }
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
+#[allow(dead_code)] // Windows 专属裸 API 的 Linux 占位（拖动走 egui StartDrag、聚焦由窗口系统接管）
 mod win32 {
+    use std::sync::Mutex;
+    use x11_dl::xlib::Xlib;
+
+    /// 主线程每帧写入的 winit 原生窗口 id（X11 Window）。0 = 尚未拿到，此时一律视为"在窗口内"。
+    static WINDOW_ID: Mutex<u64> = Mutex::new(0);
+    /// X11 连接（懒初始化）。Display 是裸指针，包一层以安全放入 Mutex。
+    struct SendDisplay(*mut x11_dl::xlib::Display);
+    // SAFETY: Display 仅在同一进程内使用，跨线程只传递指针本身（不共享连接所有权）。
+    unsafe impl Send for SendDisplay {}
+    static XLIB: Mutex<Option<Xlib>> = Mutex::new(None);
+    static DISPLAY: Mutex<Option<SendDisplay>> = Mutex::new(None);
+
+    /// 主线程每帧把 winit 原生窗口句柄写入，供 is_cursor_inside 做屏幕级光标判断。
+    pub fn set_window_id(id: u64) {
+        *WINDOW_ID.lock().unwrap() = id;
+    }
+
+    /// 判断鼠标是否位于窗口矩形内（屏幕坐标，含 6px 边距容差）。
+    /// 任何不可用（无窗口 id / 无 X 连接 / 查询失败）一律返回 true（保守：不触发隐藏）。
+    /// 这是 v1.3.1 在 Linux 上仍是"恒 true"的空 stub；此处用 XQueryPointer 真实现，
+    /// 使"鼠标离开窗口自动隐藏(autohide)"在 Linux/X11 上真正生效。
+    pub fn is_cursor_inside() -> bool {
+        let wid = *WINDOW_ID.lock().unwrap();
+        if wid == 0 {
+            return true;
+        }
+        let mut xlib_guard = XLIB.lock().unwrap();
+        if xlib_guard.is_none() {
+            *xlib_guard = Xlib::open().ok();
+        }
+        let Some(xlib) = xlib_guard.as_ref() else {
+            return true;
+        };
+        let mut disp_guard = DISPLAY.lock().unwrap();
+        if disp_guard.is_none() {
+            let d = unsafe { (xlib.XOpenDisplay)(std::ptr::null()) };
+            if d.is_null() {
+                return true;
+            }
+            *disp_guard = Some(SendDisplay(d));
+        }
+        let d = disp_guard.as_ref().unwrap().0;
+        let win = wid as x11_dl::xlib::Window;
+
+        unsafe {
+            let mut root: x11_dl::xlib::Window = 0;
+            let mut child: x11_dl::xlib::Window = 0;
+            let mut rx: i32 = 0;
+            let mut ry: i32 = 0;
+            let mut _wx: i32 = 0;
+            let mut _wy: i32 = 0;
+            let mut mask: u32 = 0;
+            // XQueryPointer 失败（例如指针不在本 X 屏幕）→ 保守返回 true
+            if (xlib.XQueryPointer)(
+                d, win, &mut root, &mut child, &mut rx, &mut ry, &mut _wx, &mut _wy, &mut mask,
+            ) == 0
+            {
+                return true;
+            }
+            // 窗口左上角屏幕坐标（相对 root）：XTranslateCoordinates(win→root, 0,0)
+            let root_win = (xlib.XDefaultRootWindow)(d);
+            let mut ax: i32 = 0;
+            let mut ay: i32 = 0;
+            let mut _child2: x11_dl::xlib::Window = 0;
+            if (xlib.XTranslateCoordinates)(d, win, root_win, 0, 0, &mut ax, &mut ay, &mut _child2) == 0
+            {
+                return true;
+            }
+            let mut attr: x11_dl::xlib::XWindowAttributes = std::mem::zeroed();
+            (xlib.XGetWindowAttributes)(d, win, &mut attr);
+            let pad = 6i32;
+            let w = attr.width as i32;
+            let h = attr.height as i32;
+            rx >= ax - pad && rx <= ax + w + pad && ry >= ay - pad && ry <= ay + h + pad
+        }
+    }
+
     pub fn toggle_window() {}
     pub fn hide_window() {}
-    pub fn is_cursor_inside() -> bool {
-        true
-    }
     pub fn place_cursor_inside() {}
+    pub fn start_window_drag() {}
+    pub fn focus_window() {}
+    pub fn is_windows7() -> bool {
+        false
+    }
     pub fn cursor_over_visible_window() -> bool {
         false
     }
@@ -431,7 +548,6 @@ mod win32 {
         true
     }
     pub fn move_window_to_xy(_x: i32, _y: i32) {}
-    pub fn focus_window() {}
 }
 
 pub struct ReaderApp {
@@ -469,9 +585,19 @@ pub struct ReaderApp {
     cursor_placed: bool,
     /// 是否已做首帧初始化（置入鼠标/位置安全/日志）
     first_frame_done: bool,
-    /// 手动拖动窗口状态：是否正在拖动
+    /// 老板键：当前窗口是否可见（初始 true）
+    boss_visible: bool,
+    /// 老板键：隐藏前是否在自动翻页，唤回时恢复
+    auto_was_running: bool,
+    /// 老板键：后台热键线程置位，主线程在 update() 消费后执行隐藏/唤回
+    boss_evt: Arc<AtomicBool>,
+    /// 自动隐藏(autohide)：后台采样线程检测到鼠标移出窗口后置位，主线程消费后隐藏
+    autohide_evt: Arc<AtomicBool>,
+    /// 手动拖动窗口状态：是否正在拖动（Windows 自绘拖动专用；Linux 走 StartDrag）
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     drag_active: bool,
-    /// 手动拖动窗口状态：按下时鼠标相对窗口左上角的偏移
+    /// 手动拖动窗口状态：按下时鼠标相对窗口左上角的偏移（Windows 专用）
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     drag_offset: Vec2,
 }
 
@@ -481,15 +607,28 @@ impl ReaderApp {
         let available_fonts = fonts::available_chinese_fonts();
         {
             let mut fonts = egui::FontDefinitions::default();
-            fonts::install_fonts(&mut fonts, &available_fonts);
+            // Win7 的 GDI 渲染下中英混排基线错位明显（菜单数字/字母/文字不在一条线），
+            // 检测到 Win7 时把中文字体作为 UI 默认族的第一字体，全部字符统一渲染。
+            let unify_baseline = win32::is_windows7();
+            if unify_baseline {
+                log::app_log("Windows 7 detected: unify UI font baseline");
+            }
+            fonts::install_fonts(&mut fonts, &available_fonts, unify_baseline);
             cc.egui_ctx.set_fonts(fonts);
         }
+
+        // 老板键/自动隐藏事件标志：后台线程置位，主线程 update() 消费后执行隐藏/唤回。
+        // 不在后台线程里直接操作窗口：隐藏/唤回需同时暂停/恢复自动翻页（UI 状态），
+        // 而 UI 状态只在主线程帧内安全变更；egui Context 可跨线程 request_repaint 唤醒帧循环。
+        let boss_evt = Arc::new(AtomicBool::new(false));
+        let autohide_evt = Arc::new(AtomicBool::new(false));
 
         // 老板键热键注册：GlobalHotKeyManager 必须创建在“运行事件循环的线程”上，
         // WM_HOTKEY 由该线程的消息泵分发到 global_hotkey_proc。若建在主线程，
         // 主窗口隐藏后 eframe/winit 事件循环睡死、不再泵消息，Alt+Z 将不再送达
         // （实测表现：老板键隐藏后无法再次唤回）。
         // 因此改在专用线程创建管理器 + 注册热键 + 独立 GetMessageW 消息泵，与主线程解耦。
+        #[cfg(target_os = "windows")]
         {
             std::thread::Builder::new()
                 .name("hotkey-pump".to_string())
@@ -511,6 +650,32 @@ impl ReaderApp {
                 })
                 .ok();
         }
+        // Linux（X11/Wayland）：GlobalHotKeyManager 在主线程创建并注册（X 服务器接管），
+        // 这里只起一个 receiver 线程把热键事件转成 boss_evt 标志，真正隐藏/唤回
+        // 由主线程 update() 消费后执行（egui ViewportCommand::Visible）。
+        #[cfg(not(target_os = "windows"))]
+        {
+            let hotkey_manager = GlobalHotKeyManager::new().ok();
+            let current_hotkey = parse_hotkey(BOSS_KEY);
+            if let (Some(mgr), Some(hk)) = (&hotkey_manager, &current_hotkey) {
+                let _ = mgr.register(*hk);
+            }
+            let _ = hotkey_manager; // 保持注册有效（Drop 注销热键）
+            let boss_evt = boss_evt.clone();
+            let egui_ctx = cc.egui_ctx.clone();
+            std::thread::Builder::new()
+                .name("hotkey-evt".to_string())
+                .spawn(move || {
+                    let rx = GlobalHotKeyEvent::receiver().clone();
+                    while let Ok(ev) = rx.recv() {
+                        if ev.state == global_hotkey::HotKeyState::Pressed {
+                            boss_evt.store(true, Ordering::SeqCst);
+                            egui_ctx.request_repaint();
+                        }
+                    }
+                })
+                .ok();
+        }
 
         // 老板模式（鼠标离开窗口自动隐藏）：
         // 与老板键同理，隐藏窗口后 eframe 事件循环会睡死、update() 不执行，
@@ -519,6 +684,8 @@ impl ReaderApp {
         let auto_hide_enabled = Arc::new(AtomicBool::new(config.auto_hide_on_mouse_leave));
         {
             let enabled = auto_hide_enabled.clone();
+            let autohide_evt = autohide_evt.clone();
+            let egui_ctx = cc.egui_ctx.clone();
             std::thread::spawn(move || {
                 let mut consecutive_out = 0u32;
                 loop {
@@ -532,7 +699,17 @@ impl ReaderApp {
                     } else {
                         consecutive_out += 1;
                         if consecutive_out >= 2 {
+                            // Windows：线程内直接调 Win32 隐藏（隐藏后事件循环睡死，
+                            // 无法等 update() 消费；且隐藏不涉及 UI 状态暂停）。
+                            #[cfg(target_os = "windows")]
                             win32::hide_window();
+                            // Linux：置标志并唤醒主线程，由 update() 统一执行隐藏
+                            // （隐藏需同时暂停自动翻页等 UI 状态，只在主线程安全变更）。
+                            #[cfg(not(target_os = "windows"))]
+                            {
+                                autohide_evt.store(true, Ordering::SeqCst);
+                                egui_ctx.request_repaint();
+                            }
                         }
                     }
                 }
@@ -570,6 +747,10 @@ impl ReaderApp {
             auto_hide_enabled,
             cursor_placed: false,
             first_frame_done: false,
+            boss_visible: true,
+            auto_was_running: false,
+            boss_evt,
+            autohide_evt,
             drag_active: false,
             drag_offset: Vec2::ZERO,
         };
@@ -877,9 +1058,17 @@ impl ReaderApp {
 }
 
 impl eframe::App for ReaderApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         if let Some(p) = self.pending_open.take() {
             self.load_file(&p);
+        }
+
+        // 记录原生窗口句柄（X11 Window id），供 Linux autohide 做屏幕级光标检测
+        #[cfg(target_os = "linux")]
+        if let Ok(wh) = frame.window_handle() {
+            if let raw_window_handle::RawWindowHandle::Xlib(xh) = wh.as_raw() {
+                win32::set_window_id(xh.window);
+            }
         }
 
         // 首帧初始化：置入鼠标 + 窗口位置安全 + 记录日志
@@ -915,9 +1104,20 @@ impl eframe::App for ReaderApp {
         // 悬停聚焦：用裸 Win32 判断“窗口不是前台”+“光标在窗口内”再抢焦点。
         // 不依赖 egui 的 focused（该状态会陈旧为 true 导致永不聚焦——表现为
         // ESC/右键每次都要先单击）。窗口隐藏时 cursor_over_visible_window 返回 false。
+        // （Linux 分支的 cursor_over_visible_window 恒 false，不触发抢焦点。）
         if win32::cursor_over_visible_window() && !win32::is_foreground() {
             crate::log::app_log("hover-focus: cursor in window & not foreground -> focus_window()");
             win32::focus_window();
+        }
+
+        // 老板键：消费后台热键线程置位的标志，统一在主线程执行隐藏/唤回。
+        // （Windows 走专用消息泵直接操作窗口，标志恒 false，此段无副作用。）
+        if self.boss_evt.swap(false, Ordering::SeqCst) {
+            self.toggle_boss_key(ctx);
+        }
+        // 自动隐藏(autohide)：后台采样线程检测到鼠标移出窗口后置位，这里在主线程执行隐藏
+        if self.autohide_evt.swap(false, Ordering::SeqCst) {
+            self.hide_window(ctx);
         }
 
 
@@ -968,9 +1168,9 @@ impl eframe::App for ReaderApp {
         // 标题栏
         self.draw_titlebar(ctx);
 
-        // 主区域
+        // 主区域：不再有独立开屏页，未打开文件时直接显示阅读界面（内含使用说明）
         if self.text.is_empty() {
-            self.draw_landing(ctx);
+            self.draw_empty_guide(ctx);
         } else {
             self.draw_reader(ctx);
         }
@@ -1009,6 +1209,48 @@ impl eframe::App for ReaderApp {
 }
 
 impl ReaderApp {
+    /// 隐藏窗口（老板键 / autohide 共用）：暂停自动翻页并记录状态，唤回时恢复。
+    /// 仅应在主线程 update() 内调用（各事件标志已在此消费）。
+    fn hide_window(&mut self, ctx: &egui::Context) {
+        if !self.boss_visible {
+            return; // 已隐藏，避免重复
+        }
+        self.boss_visible = false;
+        self.auto_was_running = self.auto_running;
+        if self.auto_running {
+            self.auto_running = false;
+            self.auto_last_tick = None;
+            self.save_progress();
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        log::app_log("window hidden (boss/autohide)");
+        ctx.request_repaint();
+    }
+
+    /// 显示窗口（老板键唤回）：恢复隐藏前的自动翻页状态。
+    fn show_window(&mut self, ctx: &egui::Context) {
+        if self.boss_visible {
+            return;
+        }
+        self.boss_visible = true;
+        if self.auto_was_running {
+            self.auto_running = true;
+            self.auto_last_tick = Some(Instant::now());
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        log::app_log("window shown");
+        ctx.request_repaint();
+    }
+
+    /// 老板键：切换窗口可见性。
+    fn toggle_boss_key(&mut self, ctx: &egui::Context) {
+        if self.boss_visible {
+            self.hide_window(ctx);
+        } else {
+            self.show_window(ctx);
+        }
+    }
+
     fn reader_page_height(&self, ctx: &egui::Context) -> f32 {
         let screen = ctx.screen_rect();
         (screen.height() - self.titlebar_h() - 60.0).max(40.0)
@@ -1139,34 +1381,50 @@ impl ReaderApp {
         }
     }
 
-    fn draw_landing(&mut self, ctx: &egui::Context) {
+    /// 未打开文件时的"阅读界面"：直接进入阅读区域（无独立开屏页），
+    /// 显示简短使用说明。窗口/字号等布局与阅读时完全一致。
+    fn draw_empty_guide(&mut self, ctx: &egui::Context) {
+        let max_width = self.reader_max_width(ctx);
+
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(self.bg))
             .show(ctx, |ui| {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(40.0);
-                    ui.heading(
+                ui.add_space(24.0);
+                ui.horizontal(|ui| {
+                    ui.add_space((max_width - 220.0) / 2.0);
+                    ui.label(
                         egui::RichText::new("本地 TXT 阅读器")
-                            .size(28.0)
+                            .size(24.0)
                             .color(Color32::from_rgb(0x33, 0x2d, 0x24)),
                     );
-                    ui.add_space(8.0);
-                    ui.label(
-                        egui::RichText::new("Rust 版 · 老板键 · 窗口记忆 · 自动恢复进度 · 极小窗口")
-                            .size(14.0)
-                            .color(Color32::from_rgb(0x7a, 0x6f, 0x5a)),
-                    );
-                    ui.add_space(24.0);
-                    if ui.add(egui::Button::new("打开 TXT 文件").min_size(Vec2::new(160.0, 44.0))).clicked() {
-                        self.open_file_dialog();
-                    }
-                    ui.add_space(12.0);
-                    ui.label(
-                        egui::RichText::new("也可将 TXT 文件直接拖入窗口")
-                            .size(12.0)
-                            .color(Color32::from_rgb(0x7a, 0x6f, 0x5a)),
-                    );
                 });
+                ui.add_space(12.0);
+                let items: &[(&str, &str)] = &[
+                    ("打开文件", "点击中间 1/3 弹出设置 → “打开 TXT 文件”，或直接按 Ctrl+O；也可将 TXT 拖入窗口"),
+                    ("翻页", "点击阅读区左 1/3 上一页 / 右 1/3 下一页；键盘 ← / →；鼠标滚轮向下下一页"),
+                    ("设置", "点击阅读区中间 1/3 弹出菜单：字号、字体、文字/背景色、自动翻页、跳转目录"),
+                    ("自动翻页", "空格键启动 / 停止；间隔在设置菜单中调节（0.5s – 3s）"),
+                    ("老板键", "Alt+Z 一键隐藏 / 唤回窗口；鼠标离开窗口可自动隐藏（设置菜单开关）"),
+                    ("进度", "阅读位置按文件自动保存在本机，下次打开自动续读"),
+                ];
+                for (k, v) in items {
+                    ui.horizontal(|ui| {
+                        ui.add_space(30.0);
+                        ui.label(
+                            egui::RichText::new(*k)
+                                .size(15.0)
+                                .strong()
+                                .color(Color32::from_rgb(0x3e, 0x6b, 0x57)),
+                        );
+                        ui.add_space(12.0);
+                        ui.label(
+                            egui::RichText::new(*v)
+                                .size(14.0)
+                                .color(Color32::from_rgb(0x55, 0x4c, 0x3d)),
+                        );
+                    });
+                    ui.add_space(10.0);
+                }
             });
     }
 
@@ -1262,18 +1520,29 @@ impl ReaderApp {
                     let drag_resp =
                         ui.interact(drag_rect, ui.id().with("win_drag"), egui::Sense::drag());
                     if drag_resp.drag_started() {
-                        // 偏移量用裸 Win32 坐标（物理像素，与 SetWindowPos 同坐标系），
+                        // Windows：偏移量用裸 Win32 坐标（物理像素，与 SetWindowPos 同坐标系），
                         // 不依赖 egui 的 interact_pos / outer_rect（逻辑坐标，DPI 缩放时错位）。
-                        let (cp, wp) = (win32::cursor_pos(), win32::window_pos());
-                        if let (Some((cx, cy)), Some((wx, wy))) = (cp, wp) {
-                            self.drag_offset = Vec2::new(cx as f32 - wx as f32, cy as f32 - wy as f32);
+                        #[cfg(target_os = "windows")]
+                        {
+                            let (cp, wp) = (win32::cursor_pos(), win32::window_pos());
+                            if let (Some((cx, cy)), Some((wx, wy))) = (cp, wp) {
+                                self.drag_offset = Vec2::new(cx as f32 - wx as f32, cy as f32 - wy as f32);
+                            }
+                            self.drag_active = true;
+                            crate::log::app_log(&format!(
+                                "drag start: cur={:?} win={:?} off=({:.0},{:.0})",
+                                cp, wp, self.drag_offset.x, self.drag_offset.y
+                            ));
                         }
-                        self.drag_active = true;
-                        crate::log::app_log(&format!(
-                            "drag start: cur={:?} win={:?} off=({:.0},{:.0})",
-                            cp, wp, self.drag_offset.x, self.drag_offset.y
-                        ));
+                        // Linux（X11/Wayland）：egui-winit 0.29 已将
+                        // ViewportCommand::StartDrag 映射到 winit drag_window()，
+                        // 原生接管窗口移动（无边框自绘标题栏的标准做法）。
+                        #[cfg(not(target_os = "windows"))]
+                        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                     }
+                    // Windows 拖动延续：用裸 Win32 物理按键状态逐帧手动跟随。
+                    // （Linux 走 StartDrag 后由窗口系统接管，无此段。）
+                    #[cfg(target_os = "windows")]
                     if self.drag_active {
                         // 延续用裸 Win32 物理按键状态（GetAsyncKeyState 反映真实按键）。
                         let down = win32::left_button_down();

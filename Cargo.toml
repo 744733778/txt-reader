@@ -1,23 +1,35 @@
 [package]
 name = "txt-reader-rs"
-version = "1.2.0"
+version = "1.4.0"
 edition = "2021"
-description = "本地 TXT 阅读器（Rust/egui 版）：老板键、窗口记忆、自动恢复进度、极小窗口"
+rust-version = "1.82"
+description = "本地 TXT 阅读器（Rust/egui 版）：老板键、窗口记忆、自动恢复进度、极小窗口，Windows 7/10/11 + Linux"
 license = "MIT"
 
 [dependencies]
-eframe = "0.29"
-egui = "0.29"
+# 关闭 default（去掉 accesskit/accessibility → 规避其 zbus4.4 链路要求 rustc≥1.83），
+# 仅显式保留 glow(OpenGL) + 字体 + X11/Wayland 后端，Windows/Linux 均适用。
+eframe = { version = "0.29", default-features = false, features = [
+  "glow", "default_fonts", "wayland", "x11",
+] }
+egui = { version = "0.29", default-features = false, features = [
+  "default_fonts",
+] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 encoding_rs = "0.8"
 directories = "5"
 global-hotkey = "0.6"
 regex = "1"
-rfd = "0.14"
+# 关闭 xdg-portal（其 ashpd→zbus4 链路要求 rustc≥1.83）；Linux 下保留 GTK 原生文件对话框
+rfd = { version = "0.14", default-features = false, features = ["gtk3"] }
 
+# Linux autohide：X11 屏幕级光标检测（XQueryPointer）+ 取 winit 原生窗口句柄。
+# 两者均已在上游锁内作为传递依赖解析，版本固定，不引入新 MSRV 约束。
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18"
+x11-dl = "2"
+raw-window-handle = "0.6"
 
 [profile.release]
 opt-level = "z"
