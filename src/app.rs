@@ -1253,7 +1253,7 @@ impl ReaderApp {
 
     fn reader_page_height(&self, ctx: &egui::Context) -> f32 {
         let screen = ctx.screen_rect();
-        (screen.height() - self.titlebar_h() - 60.0).max(40.0)
+        (screen.height() - self.titlebar_h() - 24.0).max(30.0)
     }
 
     /// 当前标题栏高度（隐藏时为 0）
@@ -1366,6 +1366,22 @@ impl ReaderApp {
                                 .color(Color32::from_rgb(0x7a, 0x6f, 0x5a)),
                         );
                         ui.add_space(8.0);
+                        // 右上角关闭按钮：退出程序
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new("×")
+                                            .size(16.0)
+                                            .color(Color32::from_rgb(0x7a, 0x6f, 0x5a)),
+                                    )
+                                    .min_size(Vec2::new(26.0, 26.0)),
+                                )
+                                .clicked()
+                            {
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
+                        });
                     },
                 );
             });
@@ -1389,7 +1405,16 @@ impl ReaderApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(self.bg))
             .show(ctx, |ui| {
-                ui.add_space(24.0);
+                ui.add_space(self.titlebar_h());
+                let avail = ui.available_rect_before_wrap();
+                let left = avail.left() + 30.0;
+                let top = avail.top() + 10.0;
+                let content_w = (avail.width() - 60.0).max(100.0);
+                let content_h = (avail.height() - 20.0).max(40.0);
+                // 说明页同样支持中间 1/3 拖动窗口
+                self.handle_window_drag(ctx, ui, left, top, content_w, content_h);
+
+                ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     ui.add_space((max_width - 220.0) / 2.0);
                     ui.label(
@@ -1426,6 +1451,8 @@ impl ReaderApp {
                     ui.add_space(10.0);
                 }
             });
+        // 说明页也显示右下角缩放柄
+        self.draw_resize_grip(ctx);
     }
 
     fn draw_reader(&mut self, ctx: &egui::Context) {
@@ -1462,9 +1489,9 @@ impl ReaderApp {
                 ui.add_space(self.titlebar_h());
                 let avail = ui.available_rect_before_wrap();
                 let left = avail.left() + 30.0;
-                let top = avail.top() + 24.0;
+                let top = avail.top() + 10.0;
                 let content_w = (avail.width() - 60.0).max(100.0);
-                let content_h = (avail.height() - 48.0).max(40.0);
+                let content_h = (avail.height() - 20.0).max(40.0);
                 let tb_h = self.titlebar_h();
 
                 // 左键点击：左/右 1/3 翻页；中间 1/3 为窗口拖动区，不做翻页
@@ -1511,62 +1538,8 @@ impl ReaderApp {
                     }
                 }
 
-                // 中间 1/3 左键拖动：无边框模式下拖动整个窗口
-                if !self.menu_open && !self.toc_open {
-                    let drag_rect = egui::Rect::from_min_size(
-                        Pos2::new(left + content_w / 3.0, top),
-                        Vec2::new(content_w / 3.0, content_h),
-                    );
-                    let drag_resp =
-                        ui.interact(drag_rect, ui.id().with("win_drag"), egui::Sense::drag());
-                    if drag_resp.drag_started() {
-                        // Windows：偏移量用裸 Win32 坐标（物理像素，与 SetWindowPos 同坐标系），
-                        // 不依赖 egui 的 interact_pos / outer_rect（逻辑坐标，DPI 缩放时错位）。
-                        #[cfg(target_os = "windows")]
-                        {
-                            let (cp, wp) = (win32::cursor_pos(), win32::window_pos());
-                            if let (Some((cx, cy)), Some((wx, wy))) = (cp, wp) {
-                                self.drag_offset = Vec2::new(cx as f32 - wx as f32, cy as f32 - wy as f32);
-                            }
-                            self.drag_active = true;
-                            crate::log::app_log(&format!(
-                                "drag start: cur={:?} win={:?} off=({:.0},{:.0})",
-                                cp, wp, self.drag_offset.x, self.drag_offset.y
-                            ));
-                        }
-                        // Linux（X11/Wayland）：egui-winit 0.29 已将
-                        // ViewportCommand::StartDrag 映射到 winit drag_window()，
-                        // 原生接管窗口移动（无边框自绘标题栏的标准做法）。
-                        #[cfg(not(target_os = "windows"))]
-                        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                    }
-                    // Windows 拖动延续：用裸 Win32 物理按键状态逐帧手动跟随。
-                    // （Linux 走 StartDrag 后由窗口系统接管，无此段。）
-                    #[cfg(target_os = "windows")]
-                    if self.drag_active {
-                        // 延续用裸 Win32 物理按键状态（GetAsyncKeyState 反映真实按键）。
-                        let down = win32::left_button_down();
-                        let vis = win32::is_visible();
-                        let cur = win32::cursor_pos();
-                        if down && vis {
-                            if let Some((cx, cy)) = cur {
-                                win32::move_window_to_xy(
-                                    (cx as f32 - self.drag_offset.x).round() as i32,
-                                    (cy as f32 - self.drag_offset.y).round() as i32,
-                                );
-                            }
-                            // 保证拖动期间每帧都执行 update（否则窗口移动后无事件驱动重绘）
-                            ctx.request_repaint();
-                        } else {
-                            self.drag_active = false;
-                            crate::log::app_log(&format!(
-                                "drag end: down={} vis={} cur={:?}",
-                                down, vis, cur
-                            ));
-                            win32::focus_window();
-                        }
-                    }
-                }
+                // 中间 1/3 左键拖动：无边框模式下拖动整个窗口（阅读/说明页共用）
+                self.handle_window_drag(ctx, ui, left, top, content_w, content_h);
 
                 let start = self.cur_start();
                 let end = pagination::page_end_at(
@@ -1632,6 +1605,74 @@ impl ReaderApp {
 
         // 无边框模式下右下角缩放柄：拖动可调整窗口大小
         self.draw_resize_grip(ctx);
+    }
+
+    /// 中间 1/3 左键拖动：无边框模式下拖动整个窗口（阅读界面 / 说明页共用）。
+    /// 菜单或目录打开时不响应。
+    fn handle_window_drag(
+        &mut self,
+        ctx: &egui::Context,
+        ui: &mut egui::Ui,
+        left: f32,
+        top: f32,
+        content_w: f32,
+        content_h: f32,
+    ) {
+        if self.menu_open || self.toc_open {
+            return;
+        }
+        let drag_rect = egui::Rect::from_min_size(
+            Pos2::new(left + content_w / 3.0, top),
+            Vec2::new(content_w / 3.0, content_h),
+        );
+        let drag_resp = ui.interact(drag_rect, ui.id().with("win_drag"), egui::Sense::drag());
+        if drag_resp.drag_started() {
+            // Windows：偏移量用裸 Win32 坐标（物理像素，与 SetWindowPos 同坐标系），
+            // 不依赖 egui 的 interact_pos / outer_rect（逻辑坐标，DPI 缩放时错位）。
+            #[cfg(target_os = "windows")]
+            {
+                let (cp, wp) = (win32::cursor_pos(), win32::window_pos());
+                if let (Some((cx, cy)), Some((wx, wy))) = (cp, wp) {
+                    self.drag_offset = Vec2::new(cx as f32 - wx as f32, cy as f32 - wy as f32);
+                }
+                self.drag_active = true;
+                crate::log::app_log(&format!(
+                    "drag start: cur={:?} win={:?} off=({:.0},{:.0})",
+                    cp, wp, self.drag_offset.x, self.drag_offset.y
+                ));
+            }
+            // Linux（X11/Wayland）：egui-winit 0.29 已将
+            // ViewportCommand::StartDrag 映射到 winit drag_window()，
+            // 原生接管窗口移动（无边框自绘标题栏的标准做法）。
+            #[cfg(not(target_os = "windows"))]
+            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        }
+        // Windows 拖动延续：用裸 Win32 物理按键状态逐帧手动跟随。
+        // （Linux 走 StartDrag 后由窗口系统接管，无此段。）
+        #[cfg(target_os = "windows")]
+        if self.drag_active {
+            // 延续用裸 Win32 物理按键状态（GetAsyncKeyState 反映真实按键）。
+            let down = win32::left_button_down();
+            let vis = win32::is_visible();
+            let cur = win32::cursor_pos();
+            if down && vis {
+                if let Some((cx, cy)) = cur {
+                    win32::move_window_to_xy(
+                        (cx as f32 - self.drag_offset.x).round() as i32,
+                        (cy as f32 - self.drag_offset.y).round() as i32,
+                    );
+                }
+                // 保证拖动期间每帧都执行 update（否则窗口移动后无事件驱动重绘）
+                ctx.request_repaint();
+            } else {
+                self.drag_active = false;
+                crate::log::app_log(&format!(
+                    "drag end: down={} vis={} cur={:?}",
+                    down, vis, cur
+                ));
+                win32::focus_window();
+            }
+        }
     }
 
     /// 右下角缩放柄（无边框窗口调整大小用）
@@ -1883,6 +1924,14 @@ impl ReaderApp {
                                 .clicked()
                             {
                                 self.menu_open = false;
+                            }
+                            ui.add_space(8.0);
+                            // 隐藏标题栏时的退出入口
+                            if ui
+                                .add(egui::Button::new("退出程序").min_size(Vec2::new(panel_w - 64.0, 36.0)))
+                                .clicked()
+                            {
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                             }
                         });
                     });
