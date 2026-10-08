@@ -1253,7 +1253,7 @@ impl ReaderApp {
 
     fn reader_page_height(&self, ctx: &egui::Context) -> f32 {
         let screen = ctx.screen_rect();
-        (screen.height() - self.titlebar_h() - 24.0).max(30.0)
+        (screen.height() - self.titlebar_h() - 6.0).max(30.0)
     }
 
     /// 当前标题栏高度（隐藏时为 0）
@@ -1408,9 +1408,9 @@ impl ReaderApp {
                 ui.add_space(self.titlebar_h());
                 let avail = ui.available_rect_before_wrap();
                 let left = avail.left() + 30.0;
-                let top = avail.top() + 10.0;
+                let top = avail.top() + 3.0;
                 let content_w = (avail.width() - 60.0).max(100.0);
-                let content_h = (avail.height() - 20.0).max(40.0);
+                let content_h = (avail.height() - 6.0).max(40.0);
                 // 说明页同样支持中间 1/3 拖动窗口
                 self.handle_window_drag(ctx, ui, left, top, content_w, content_h);
 
@@ -1489,9 +1489,9 @@ impl ReaderApp {
                 ui.add_space(self.titlebar_h());
                 let avail = ui.available_rect_before_wrap();
                 let left = avail.left() + 30.0;
-                let top = avail.top() + 10.0;
+                let top = avail.top() + 3.0;
                 let content_w = (avail.width() - 60.0).max(100.0);
-                let content_h = (avail.height() - 20.0).max(40.0);
+                let content_h = (avail.height() - 6.0).max(40.0);
                 let tb_h = self.titlebar_h();
 
                 // 左键点击：左/右 1/3 翻页；中间 1/3 为窗口拖动区，不做翻页
