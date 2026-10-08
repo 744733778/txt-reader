@@ -148,17 +148,20 @@ pub fn prev_boundary(
     };
     let est = estimate_chars_at(ctx, text, t, font_size, line_height_px, max_width, page_height, font_family);
     let win = 400.max((est as f64 * 1.6).ceil() as usize + 120);
-    let mut lo0 = t.saturating_sub(win);
+    // 二分/扩张的候选点都会是任意字节偏移，必须逐个规整到字符边界，
+    // 否则传给 page_end_at/measure_chars 会导致切片越界/计数起点错位，
+    // 而 release=panic="abort" 会让任何 panic 直接退出整个程序。
+    let mut lo0 = floor_char_boundary(text, t.saturating_sub(win));
     while lo0 > 0 && g(lo0) >= t {
-        lo0 = lo0.saturating_sub(win);
+        lo0 = floor_char_boundary(text, lo0.saturating_sub(win));
     }
     if g(lo0) >= t {
         return 0;
     }
     let mut lo = lo0;
-    let mut hi = t - 1;
+    let mut hi = floor_char_boundary(text, t - 1);
     while hi - lo > 1 {
-        let mid = (lo + hi) / 2;
+        let mid = floor_char_boundary(text, (lo + hi) / 2);
         if g(mid) >= t {
             hi = mid;
         } else {

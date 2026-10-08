@@ -1,6 +1,6 @@
 [package]
 name = "txt-reader-rs"
-version = "1.4.0"
+version = "1.4.3"
 edition = "2021"
 rust-version = "1.82"
 description = "本地 TXT 阅读器（Rust/egui 版）：老板键、窗口记忆、自动恢复进度、极小窗口，Windows 7/10/11 + Linux"
@@ -41,3 +41,14 @@ panic = "unwind"
 [profile.release-with-debug]
 inherits = "release"
 debug = true
+
+# 显式固定可执行文件名为 txt-reader（与 AppImage / 产物路径一致）
+[[bin]]
+name = "txt-reader"
+path = "src/main.rs"
+
+# 渲染后端特性透传给 eframe：默认 glow(OpenGL)，可选 wgpu/Vulkan
+[features]
+default = ["glow"]
+glow = ["eframe/glow"]
+wgpu = ["eframe/wgpu"]
