@@ -6,7 +6,7 @@
 <title>本地 TXT 阅读器</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%233e6b57'/><path d='M7 9h9v14H7a1 1 0 0 1-1-1V10a1 1 0 0 1 1-1z' fill='%23f3ecdd'/><path d='M16 9h9a1 1 0 0 1 1 1v12a1 1 0 0 1-1 1h-9z' fill='%23efe4c8'/><path d='M16 9.5c1.6-1 3.4-1.5 5-1.5v15c-1.6 0-3.4.5-5 1.5z' fill='%23fdfaf1'/></svg>">
 <style>
-/* ===== 设计令牌 ===== */
+/* ===== 设计令牌（亮色默认） ===== */
 :root{
   --paper:#f3ecdd;
   --ink:#332d24;
@@ -14,9 +14,26 @@
   --line:#d9cdb2;
   --card:#fdfaf1;
   --muted:#7a6f5a;
+  --hover:#efe6cf;
+  --overlay:rgba(38,30,18,.36);
+  --accent-ink:#fdfaf1;
+  --accent-strong:#355f4e;
   --font:var(--serif);
   --sans:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
   --serif:"Songti SC","Noto Serif CJK SC","Source Han Serif SC","SimSun","Times New Roman",serif;
+}
+/* ===== 设计令牌（暗色） ===== */
+[data-theme="dark"]{
+  --paper:#1b1915;
+  --ink:#d6cdb8;
+  --accent:#7fa893;
+  --line:#3a362c;
+  --card:#24211b;
+  --muted:#9c8f77;
+  --hover:#2c2922;
+  --overlay:rgba(0,0,0,.55);
+  --accent-ink:#1b1915;
+  --accent-strong:#5e8a73;
 }
 *{box-sizing:border-box;margin:0;padding:0}
 html,body{height:100%}
@@ -39,11 +56,11 @@ input,select{font-family:inherit;color:inherit;font-size:14px}
   background:var(--card);color:var(--ink);user-select:none;
   transition:background .15s,border-color .15s,transform .05s;
 }
-.btn:hover{background:#efe6cf}
+.btn:hover{background:var(--hover)}
 .btn:active{transform:translateY(1px)}
 .btn:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-.btn.primary{background:var(--accent);border-color:var(--accent);color:#fdfaf1}
-.btn.primary:hover{background:#355f4e}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
+.btn.primary:hover{background:var(--accent-strong)}
 .btn.sm{padding:5px 12px;font-size:13px;border-radius:6px;min-height:34px}
 .btn.block{width:100%;margin-top:18px}
 select.enc{
@@ -52,7 +69,7 @@ select.enc{
 }
 .hex{
   width:76px;padding:5px 8px;font-size:13px;border:1px solid var(--line);
-  border-radius:6px;background:#fffef9;color:var(--ink);
+  border-radius:6px;background:var(--card);color:var(--ink);
 }
 input[type=range]{accent-color:var(--accent);cursor:pointer}
 input[type=color]{
@@ -80,7 +97,7 @@ input[type=color]::-webkit-color-swatch{border:none;border-radius:4px}
 /* ===== 阅读区 ===== */
 #reader{position:fixed;top:56px;left:0;right:0;bottom:0}
 #page-container{position:absolute;inset:0;overflow:hidden}
-#page-inner{height:100%;overflow:hidden;padding:clamp(28px,6vh,64px) clamp(24px,7vw,80px)}
+#page-inner{height:100%;overflow:hidden;padding:5px clamp(24px,7vw,80px)}
 .reader-text{
   font-family:var(--font);
   white-space:pre-wrap;
@@ -103,41 +120,50 @@ input[type=color]::-webkit-color-swatch{border:none;border-radius:4px}
 .hint.on{opacity:.4}
 #hint-l{left:4px}
 #hint-r{right:4px}
+#progress-track{
+  position:absolute;left:0;right:0;bottom:0;height:18px;
+  display:flex;align-items:center;cursor:pointer;z-index:15;
+  touch-action:none;
+}
 #progress-line{
-  position:absolute;left:0;bottom:0;height:3px;width:0;
-  background:var(--accent);transition:width .2s linear;
+  height:3px;width:0;background:var(--accent);
+  border-radius:0 2px 2px 0;pointer-events:none;
 }
 #auto-pill{
   position:absolute;top:12px;left:50%;transform:translateX(-50%);
-  background:var(--accent);color:#fdfaf1;font-size:12px;line-height:1;
+  background:var(--accent);color:var(--accent-ink);font-size:12px;line-height:1;
   padding:6px 14px;border-radius:999px;z-index:20;
   box-shadow:0 3px 10px rgba(0,0,0,.15);pointer-events:none;
   white-space:nowrap;
 }
 
-/* ===== 落地页 ===== */
-#landing{
-  min-height:100%;display:flex;align-items:center;justify-content:center;
-  padding:48px 20px;
+/* ===== 空态说明（未打开文件时显示） ===== */
+#empty-guide{
+  height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;
+  text-align:center;gap:0;padding:24px 8vw;
 }
-.landing-card{
-  width:100%;max-width:600px;padding:52px 48px 40px;
-  background:var(--card);border:1px solid var(--line);border-radius:16px;
-  box-shadow:0 16px 48px rgba(76,58,26,.10);
+.eg-title{
+  font-family:var(--serif);font-size:clamp(20px,4vw,28px);font-weight:700;letter-spacing:.06em;
+  color:var(--ink);
 }
-.lg-icon{display:block;margin:0 auto 22px;color:var(--accent)}
-.lg-title{
-  font-family:var(--serif);font-size:27px;font-weight:700;text-align:center;letter-spacing:.06em;
+.eg-sub{margin-top:8px;font-size:14px;color:var(--muted)}
+.eg-actions{margin-top:22px;display:flex;justify-content:center}
+.eg-items{
+  margin-top:30px;display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));
+  gap:10px;width:100%;max-width:760px;text-align:left;
 }
-.lg-sub{margin-top:10px;text-align:center;font-size:14px;color:var(--muted)}
-.actions{margin-top:30px;display:flex;justify-content:center;gap:12px;flex-wrap:wrap}
-.enc-row{
-  margin-top:16px;display:flex;align-items:center;justify-content:center;gap:10px;
-  font-size:13px;color:var(--muted);
+.eg-item{
+  display:flex;align-items:baseline;gap:10px;
+  padding:11px 14px;background:var(--card);border:1px solid var(--line);border-radius:10px;
 }
+.eg-k{
+  flex:0 0 auto;font-size:12.5px;font-weight:600;color:var(--accent);
+  letter-spacing:.04em;white-space:nowrap;
+}
+.eg-v{font-size:13px;color:var(--ink);line-height:1.55;min-width:0}
 /* ===== 目录面板 ===== */
 #toc-overlay{
-  position:fixed;inset:0;z-index:70;background:rgba(38,30,18,.42);
+  position:fixed;inset:0;z-index:70;background:var(--overlay);
   display:flex;align-items:center;justify-content:center;padding:20px;
 }
 #toc-panel{
@@ -159,12 +185,12 @@ input[type=color]::-webkit-color-swatch{border:none;border-radius:4px}
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
   transition:background .12s;
 }
-.toc-item:hover{background:#efe6cf}
-.toc-item.cur{background:var(--accent);color:#fdfaf1;border-bottom-color:transparent}
+.toc-item:hover{background:var(--hover)}
+.toc-item.cur{background:var(--accent);color:var(--accent-ink);border-bottom-color:transparent}
 
 /* ===== 设置菜单 ===== */
 #menu-overlay{
-  position:fixed;inset:0;z-index:60;background:rgba(38,30,18,.36);
+  position:fixed;inset:0;z-index:60;background:var(--overlay);
   display:flex;align-items:center;justify-content:center;padding:20px;
 }
 #menu{
@@ -181,6 +207,11 @@ input[type=color]::-webkit-color-swatch{border:none;border-radius:4px}
 .m-val{flex:0 0 38px;text-align:center;font-size:13px;color:var(--ink)}
 .m-val.lh{flex-basis:44px}
 .m-hint{font-size:12px;color:var(--muted);margin-top:5px;margin-left:76px}
+.m-file{
+  margin-top:14px;padding:9px 12px;text-align:center;font-size:13px;color:var(--muted);
+  background:var(--paper);border:1px solid var(--line);border-radius:8px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
 
 /* ===== Toast ===== */
 #toast{
@@ -195,8 +226,7 @@ input[type=color]::-webkit-color-swatch{border:none;border-radius:4px}
 @media (max-width:640px){
   #header{padding:0 10px;gap:8px}
   .h-mid{text-align:left}
-  .landing-card{padding:40px 24px 34px}
-  #page-inner{padding:26px 20px}
+  #page-inner{padding:5px 20px}
   .btn{min-height:44px}
   .btn.sm{min-height:44px;min-width:44px}
   input[type=text].hex{font-size:16px}
@@ -207,8 +237,8 @@ input[type=color]::-webkit-color-swatch{border:none;border-radius:4px}
 </head>
 <body>
 
-<!-- ===== 顶栏（阅读模式） ===== -->
-<header id="header" hidden>
+<!-- ===== 顶栏（始终显示） ===== -->
+<header id="header">
   <div class="h-left">
     <label class="btn sm" for="file-input">打开文件</label>
     <select class="enc" id="enc-header" aria-label="文本编码">
@@ -216,39 +246,30 @@ input[type=color]::-webkit-color-swatch{border:none;border-radius:4px}
       <option value="gbk">GBK</option>
     </select>
   </div>
-  <div class="h-mid"><span class="fname" id="fname"></span><span class="fmeta" id="fmeta"></span></div>
+  <div class="h-mid"><span class="fname" id="fname">本地 TXT 阅读器</span><span class="fmeta" id="fmeta">未打开文件</span></div>
   <div class="h-right" id="progress-text">0.0%</div>
 </header>
 
-<!-- ===== 落地页 ===== -->
-<div id="landing">
-  <div class="landing-card">
-    <svg class="lg-icon" width="56" height="56" viewBox="0 0 32 32" fill="none" aria-hidden="true">
-      <path d="M7 9h9v14H7a1 1 0 0 1-1-1V10a1 1 0 0 1 1-1z" fill="#3e6b57"/>
-      <path d="M16 9h9a1 1 0 0 1 1 1v12a1 1 0 0 1-1 1h-9z" fill="#355f4e"/>
-      <path d="M16 9.5c1.6-1 3.4-1.5 5-1.5v15c-1.6 0-3.4.5-5 1.5z" fill="#f3ecdd"/>
-    </svg>
-    <h1 class="lg-title">本地 TXT 阅读器</h1>
-    <p class="lg-sub">单文件网页应用，全部在本机浏览器内运行，不上传任何内容</p>
-
-    <div class="actions">
-      <label class="btn primary" for="file-input">打开 TXT 文件</label>
-    </div>
-    <div class="enc-row">
-      <label for="enc-landing">文本编码</label>
-      <select class="enc" id="enc-landing" aria-label="文本编码">
-        <option value="utf-8">UTF-8</option>
-        <option value="gbk">GBK</option>
-      </select>
-    </div>
-  </div>
-</div>
-
-<!-- ===== 阅读区 ===== -->
-<div id="reader" hidden>
+<!-- ===== 阅读区（始终显示；未打开文件时显示使用说明） ===== -->
+<div id="reader">
   <div id="page-container">
     <div id="page-inner">
-      <div id="page-text" class="reader-text"></div>
+      <div id="empty-guide">
+        <div class="eg-title">本地 TXT 阅读器</div>
+        <div class="eg-sub">单文件网页应用，全部在本机浏览器内运行，不上传任何内容</div>
+        <div class="eg-actions">
+          <label class="btn primary" for="file-input">打开 TXT 文件</label>
+        </div>
+        <div class="eg-items">
+          <div class="eg-item"><span class="eg-k">打开文件</span><span class="eg-v">点击上方“打开文件”，或按 Ctrl+O</span></div>
+          <div class="eg-item"><span class="eg-k">翻页</span><span class="eg-v">点击阅读区左 1/3 上一页 · 右 1/3 下一页；键盘 ← / →；鼠标滚轮向下下一页</span></div>
+          <div class="eg-item"><span class="eg-k">设置</span><span class="eg-v">点击阅读区中间 1/3 弹出菜单：字号、行距、颜色、字体、自动翻页、目录、主题</span></div>
+          <div class="eg-item"><span class="eg-k">自动翻页</span><span class="eg-v">空格键启动 / 停止；间隔在设置菜单中调节（0.2s – 2s）</span></div>
+          <div class="eg-item"><span class="eg-k">编码</span><span class="eg-v">顶栏切换 UTF-8 / GBK，乱码时换一种试试</span></div>
+          <div class="eg-item"><span class="eg-k">进度</span><span class="eg-v">阅读位置按文件保存在本机，下次打开自动续读</span></div>
+        </div>
+      </div>
+      <div id="page-text" class="reader-text" hidden></div>
     </div>
     <div id="hint-l" class="hint" aria-hidden="true">
       <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg>
@@ -256,7 +277,9 @@ input[type=color]::-webkit-color-swatch{border:none;border-radius:4px}
     <div id="hint-r" class="hint" aria-hidden="true">
       <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 5l7 7-7 7"/></svg>
     </div>
-    <div id="progress-line"></div>
+    <div id="progress-track" hidden aria-label="阅读进度条" role="slider" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+      <div id="progress-line"></div>
+    </div>
     <div id="auto-pill" hidden>自动翻页</div>
   </div>
 </div>
@@ -270,6 +293,17 @@ input[type=color]::-webkit-color-swatch{border:none;border-radius:4px}
 <div id="menu-overlay" hidden>
   <div id="menu" role="dialog" aria-modal="true" aria-label="阅读设置">
     <h2>阅读设置</h2>
+
+    <div class="m-file" id="menu-fname">未打开文件</div>
+
+    <div class="m-row">
+      <span class="m-label">主题</span>
+      <div class="m-controls">
+        <button class="btn sm" id="theme-light" type="button">亮色</button>
+        <button class="btn sm" id="theme-dark" type="button">暗色</button>
+        <span class="m-val lh" id="theme-state"></span>
+      </div>
+    </div>
 
     <div class="m-row">
       <span class="m-label">字号</span>
@@ -330,15 +364,8 @@ input[type=color]::-webkit-color-swatch{border:none;border-radius:4px}
     <div class="m-row">
       <span class="m-label">自动翻页</span>
       <div class="m-controls">
-        <select class="enc" id="auto-rate" aria-label="自动翻页间隔">
-          <option value="0.5">0.5s</option>
-          <option value="0.75">0.75s</option>
-          <option value="1" selected>1s</option>
-          <option value="1.5">1.5s</option>
-          <option value="2">2s</option>
-          <option value="2.5">2.5s</option>
-          <option value="3">3s</option>
-        </select>
+        <input type="range" id="auto-rate" min="0.2" max="2" step="0.1" value="1" aria-label="自动翻页间隔">
+        <span class="m-val lh" id="auto-val">1.0s</span>
         <span class="m-val lh" id="auto-state">已停止</span>
       </div>
       <p class="m-hint">空格键 启动 / 停止，每次上移一行</p>
@@ -383,7 +410,7 @@ input[type=color]::-webkit-color-swatch{border:none;border-radius:4px}
 var STATE={
   rawBuf:null, text:'', name:'', total:0,
   fontSize:19, lineHeight:1.9, fg:'#332d24', bg:'#f3ecdd', font:'',
-  enc:'utf-8',
+  enc:'utf-8', theme:'light', customColor:false,
   pageStarts:[0], k:0,
   menuOpen:false, tocOpen:false,
   autoMs:1000, autoRunning:false, autoTimer:null, autoTickCount:0,
@@ -391,6 +418,12 @@ var STATE={
   dragX:0, dragY:0
 };
 var STORE_PREFIX='txt-reader:v1:';
+var THEME_KEY=STORE_PREFIX+'theme';
+/* 主题预设：切换时写入正文前景/背景色 + UI 变量（--paper/--ink 等由 CSS [data-theme] 控制） */
+var THEMES={
+  light:{fg:'#332d24', bg:'#f3ecdd'},
+  dark:{fg:'#d6cdb8', bg:'#1b1915'}
+};
 var FONT_MIN=14, FONT_MAX=32, FONT_STEP=2;
 /* 系统字体选项：value 存下拉项，栈用于实际渲染（含跨平台 fallback） */
 var FONTS={
@@ -412,21 +445,24 @@ var FONTS={
 
 /* ================= DOM ================= */
 function $(id){ return document.getElementById(id); }
-var fileInput=$('file-input'), encLand=$('enc-landing'), encHead=$('enc-header'),
-    header=$('header'), landing=$('landing'), reader=$('reader'),
+var fileInput=$('file-input'), encHead=$('enc-header'),
+    header=$('header'), reader=$('reader'),
     pageContainer=$('page-container'), pageInner=$('page-inner'), pageText=$('page-text'),
+    emptyGuide=$('empty-guide'),
     measureEl=$('measure'),
     fnameEl=$('fname'), fmetaEl=$('fmeta'),
-    progressText=$('progress-text'), progressLine=$('progress-line'),
+    progressText=$('progress-text'), progressLine=$('progress-line'), progressTrack=$('progress-track'),
     hintL=$('hint-l'), hintR=$('hint-r'),
     overlay=$('menu-overlay'), menu=$('menu'),
+    themeLight=$('theme-light'), themeDark=$('theme-dark'), themeState=$('theme-state'),
     fontDec=$('font-dec'), fontInc=$('font-inc'), fontVal=$('font-val'),
     lhRange=$('lh-range'), lhVal=$('lh-val'),
     fgColor=$('fg-color'), fgHex=$('fg-hex'),
     bgColor=$('bg-color'), bgHex=$('bg-hex'),
     tocBtn=$('toc-btn'), tocCount=$('toc-count'), tocTitle=$('toc-title'),
     tocOverlay=$('toc-overlay'), tocPanel=$('toc-panel'), tocList=$('toc-list'), tocClose=$('toc-close'),
-    fontSelect=$('font-select'), autoRate=$('auto-rate'), autoState=$('auto-state'), autoPill=$('auto-pill'),
+    menuFname=$('menu-fname'),
+    fontSelect=$('font-select'), autoRate=$('auto-rate'), autoVal=$('auto-val'), autoState=$('auto-state'), autoPill=$('auto-pill'),
     menuClose=$('menu-close'), toastEl=$('toast');
 
 /* ================= 工具 ================= */
@@ -459,6 +495,7 @@ function saveRecord(){
     fg:STATE.fg,
     bg:STATE.bg,
     font:STATE.font,
+    customColor:STATE.customColor,
     autoMs:STATE.autoMs,
     vw:window.innerWidth,
     vh:window.innerHeight,
@@ -520,18 +557,28 @@ function pageEndAt(start){
   }
   return lo;
 }
+/* 把偏移规整到字符边界：避免落在 UTF-16 代理对中间（emoji/生僻字），
+   对齐桌面版 v1.4.3 的 floor_char_boundary 修复，防止上翻页切片错位 */
+function floorCharBoundary(t, idx){
+  if(idx<0) return 0;
+  if(idx>t.length) return t.length;
+  var c0=idx>0 ? t.charCodeAt(idx-1) : -1;
+  var c1=idx<t.length ? t.charCodeAt(idx) : -1;
+  if(c0>=0xD800 && c0<=0xDBFF && c1>=0xDC00 && c1<=0xDFFF) return idx-1;
+  return idx;
+}
 /* 找 t 之前最近的页边界（t 本身是一个页起始） */
 function prevBoundary(t){
   if(t<=0) return 0;
   function g(x){ return x+pageEndAt(x); }
   var est=estimateCharsAt(t);
   var win=Math.max(400, Math.ceil(est*1.6)+120);
-  var lo0=Math.max(0, t-win);
-  while(lo0>0 && g(lo0)>=t){ lo0=Math.max(0, lo0-win); }
+  var lo0=floorCharBoundary(STATE.text, Math.max(0, t-win));
+  while(lo0>0 && g(lo0)>=t){ lo0=floorCharBoundary(STATE.text, Math.max(0, lo0-win)); }
   if(g(lo0)>=t) return 0;
-  var lo=lo0, hi=t-1;
+  var lo=lo0, hi=floorCharBoundary(STATE.text, t-1);
   while(hi-lo>1){
-    var mid=(lo+hi)>>1;
+    var mid=floorCharBoundary(STATE.text, (lo+hi)>>1);
     if(g(mid)>=t) hi=mid; else lo=mid;
   }
   return hi;
@@ -549,13 +596,23 @@ function render(){
   }
   updateChrome();
 }
+/* 当前阅读位置所属章节标题；未识别到章节时返回空 */
+function currentChapter(){
+  var cur=curStart(), best='';
+  for(var i=0;i<TOC.length;i++){
+    if(TOC[i].o<=cur) best=TOC[i].t; else break;
+  }
+  return best;
+}
 function updateChrome(){
   var total=STATE.total, start=curStart();
   if(!total) return;
-  fnameEl.textContent=STATE.name;
+  var chap=currentChapter();
+  fnameEl.textContent=chap || STATE.name;
   fmetaEl.textContent=total.toLocaleString()+' 字';
   var p=clamp(start/total*100,0,100);
   progressLine.style.width=p.toFixed(2)+'%';
+  progressTrack.setAttribute('aria-valuenow', String(Math.round(p)));
   progressText.textContent=p.toFixed(1)+'%';
 }
 function jumpTo(t, doSave){
@@ -693,8 +750,22 @@ function applyFont(f){
   document.documentElement.style.setProperty('--font', STATE.font ? FONTS[STATE.font] : 'var(--serif)');
   syncMenuControls();
 }
-function setFg(v){ if(!isHex(v)) return; STATE.fg=v.toLowerCase(); pageText.style.color=STATE.fg; fgColor.value=STATE.fg; fgHex.value=STATE.fg; saveRecord(); }
-function setBg(v){ if(!isHex(v)) return; STATE.bg=v.toLowerCase(); document.body.style.background=STATE.bg; bgColor.value=STATE.bg; bgHex.value=STATE.bg; saveRecord(); }
+/* ================= 主题 ================= */
+function applyTheme(t, save){
+  if(THEMES[t]===undefined) t='light';
+  STATE.theme=t;
+  document.documentElement.setAttribute('data-theme', t);
+  /* 主题色仅作为默认正文色：用户若已自定义颜色（含文件级记录）则不被覆盖 */
+  if(!STATE.customColor){
+    applyStyle(STATE.fontSize, STATE.lineHeight, THEMES[t].fg, THEMES[t].bg);
+  }
+  syncMenuControls();
+  if(save!==false){
+    try{ localStorage.setItem(THEME_KEY, t); }catch(e){}
+  }
+}
+function setFg(v){ if(!isHex(v)) return; STATE.customColor=true; STATE.fg=v.toLowerCase(); pageText.style.color=STATE.fg; fgColor.value=STATE.fg; fgHex.value=STATE.fg; saveRecord(); }
+function setBg(v){ if(!isHex(v)) return; STATE.customColor=true; STATE.bg=v.toLowerCase(); document.body.style.background=STATE.bg; bgColor.value=STATE.bg; bgHex.value=STATE.bg; saveRecord(); }
 function changeFont(d){
   applyStyle(STATE.fontSize+d, STATE.lineHeight, STATE.fg, STATE.bg);
   render(); saveRecord();
@@ -707,7 +778,10 @@ function syncMenuControls(){
   bgColor.value=STATE.bg; bgHex.value=STATE.bg;
   fontSelect.value=STATE.font;
   autoRate.value=String(STATE.autoMs/1000);
+  autoVal.textContent=fmtAutoSec()+'s';
   autoState.textContent=STATE.autoRunning?'运行中':'已停止';
+  themeState.textContent=STATE.theme==='dark'?'暗色':'亮色';
+  menuFname.textContent=STATE.name || '未打开文件';
   tocCount.textContent=TOC.length ? TOC.length+' 章' : '…';
 }
 
@@ -720,10 +794,11 @@ function toggleMenu(){ STATE.menuOpen ? closeMenu() : openMenu(); }
 function decodeText(buf, enc){
   return new TextDecoder(enc).decode(buf);
 }
+/* 进入正文：隐藏空态说明，显示正文页 */
 function showReader(){
-  landing.hidden=true;
-  header.hidden=false;
-  reader.hidden=false;
+  emptyGuide.hidden=true;
+  pageText.hidden=false;
+  progressTrack.hidden=false;
 }
 function applyText(name, text){
   stopAuto(true);
@@ -735,8 +810,10 @@ function applyText(name, text){
   if(STATE.total>60*1024*1024){ toast('文件较大，分页与跳转可能稍慢'); }
 
   var rec=loadRecord(name);
+  /* 历史记录中标注过自定义颜色时，主题切换不覆盖正文色（旧记录无此字段，视为未自定义） */
+  STATE.customColor=rec ? !!rec.customColor : false;
   if(rec && typeof rec.font==='string' && FONTS[rec.font]!==undefined) STATE.font=rec.font;
-  if(rec && typeof rec.autoMs==='number' && rec.autoMs>=500 && rec.autoMs<=3000) STATE.autoMs=rec.autoMs;
+  if(rec && typeof rec.autoMs==='number' && rec.autoMs>=200 && rec.autoMs<=2000) STATE.autoMs=rec.autoMs;
   STATE.pageStarts=[0]; STATE.k=0;
   tocCount.textContent='…';
   setTimeout(buildToc, 0);
@@ -837,6 +914,8 @@ function buildToc(){
 function syncToc(){
   tocCount.textContent=TOC.length ? TOC.length+' 章' : '…';
   tocTitle.textContent=STATE.name;
+  /* 目录构建完成后刷新顶栏章节名 */
+  if(STATE.text) updateChrome();
 }
 /* 渲染目录并打开 */
 function openToc(){
@@ -884,13 +963,12 @@ fileInput.addEventListener('change', function(){
 });
 
 /* 编码切换 */
-function syncEnc(v){ STATE.enc=v; encLand.value=v; encHead.value=v; }
+function syncEnc(v){ STATE.enc=v; encHead.value=v; }
 function changeEnc(v){
   if(v==='gbk' && !STATE.gbkOK){ toast('当前浏览器不支持 GBK 解码'); return; }
   syncEnc(v);
   if(STATE.rawBuf){ loadFromBuf(STATE.name); }
 }
-encLand.addEventListener('change', function(){ changeEnc(this.value); });
 encHead.addEventListener('change', function(){ changeEnc(this.value); });
 
 /* 阅读区三分区点击 */
@@ -900,6 +978,8 @@ pageContainer.addEventListener('mousedown', function(e){
 pageContainer.addEventListener('click', function(e){
   /* 拖拽选择文本后松开，不触发翻页 */
   if(Math.abs(e.clientX-STATE.dragX)+Math.abs(e.clientY-STATE.dragY)>8) return;
+  /* 交互控件（打开按钮、编码选择等）点击不触发分区翻页/菜单 */
+  if(e.target.closest && e.target.closest('label,button,select,input,textarea')) return;
   var r=pageContainer.getBoundingClientRect();
   var x=e.clientX-r.left, w=r.width;
   if(x<w/3) prevPage();
@@ -918,6 +998,38 @@ pageContainer.addEventListener('mouseleave', function(){
   hintR.classList.remove('on');
 });
 
+/* 进度条拖动跳转（拖动即定位；自动翻页运行中拖动会停止） */
+var trackDragging=false;
+function seekFromEvent(e){
+  var r=progressTrack.getBoundingClientRect();
+  if(r.width<=0) return;
+  var ratio=clamp((e.clientX-r.left)/r.width, 0, 1);
+  /* 拖到 100% 落在最后一行，不落空页 */
+  var off=Math.round(ratio*STATE.total);
+  if(off>=STATE.total && STATE.total>0) off=STATE.total-1;
+  jumpTo(off, true);
+}
+progressTrack.addEventListener('pointerdown', function(e){
+  if(!STATE.text) return;
+  e.preventDefault();
+  trackDragging=true;
+  if(progressTrack.setPointerCapture){ try{ progressTrack.setPointerCapture(e.pointerId); }catch(err){} }
+  seekFromEvent(e);
+});
+progressTrack.addEventListener('pointermove', function(e){
+  if(!trackDragging) return;
+  seekFromEvent(e);
+});
+progressTrack.addEventListener('pointerup', function(){
+  if(!trackDragging) return;
+  trackDragging=false;
+  saveRecord();
+});
+progressTrack.addEventListener('pointercancel', function(){
+  trackDragging=false;
+});
+progressTrack.addEventListener('click', function(e){ e.stopPropagation(); });
+
 /* 鼠标滚轮翻页（向下=下一页，向上=上一页），节流防连翻 */
 var lastWheelTs=0;
 pageContainer.addEventListener('wheel', function(e){
@@ -934,20 +1046,23 @@ pageContainer.addEventListener('wheel', function(e){
 overlay.addEventListener('click', closeMenu);
 menu.addEventListener('click', function(e){ e.stopPropagation(); });
 menuClose.addEventListener('click', closeMenu);
+themeLight.addEventListener('click', function(){ applyTheme('light', true); toast('已切换到亮色主题'); });
+themeDark.addEventListener('click', function(){ applyTheme('dark', true); toast('已切换到暗色主题'); });
 fontDec.addEventListener('click', function(){ changeFont(-FONT_STEP); });
 fontInc.addEventListener('click', function(){ changeFont(FONT_STEP); });
 fontSelect.addEventListener('change', function(){
   applyFont(this.value);
   render(); saveRecord();
 });
+autoRate.addEventListener('input', function(){ autoVal.textContent=(+this.value).toFixed(1)+'s'; });
 autoRate.addEventListener('change', function(){
-  STATE.autoMs=parseFloat(this.value)*1000;
+  STATE.autoMs=Math.round(parseFloat(this.value)*1000);
+  autoVal.textContent=(+this.value).toFixed(1)+'s';
   if(STATE.autoRunning){
     clearInterval(STATE.autoTimer);
     STATE.autoTimer=setInterval(autoTick, STATE.autoMs);
     updateAutoPill();
   }
-  autoState.textContent=STATE.autoRunning?'运行中':'已停止';
   saveRecord();
 });
 lhRange.addEventListener('input', function(){ lhVal.textContent=(+this.value).toFixed(2); });
@@ -976,6 +1091,9 @@ document.addEventListener('keydown', function(e){
   if(tag==='INPUT'||tag==='SELECT'||tag==='TEXTAREA') return;
   if(e.key==='ArrowLeft'){ e.preventDefault(); prevPage(); }
   else if(e.key==='ArrowRight'){ e.preventDefault(); nextPage(); }
+  else if((e.ctrlKey||e.metaKey) && (e.key==='o'||e.key==='O')){
+    e.preventDefault(); fileInput.click();
+  }
   else if(e.code==='Space'){
     if(!STATE.menuOpen && !STATE.tocOpen){
       e.preventDefault();
@@ -1013,7 +1131,10 @@ function toast(msg){
 /* ================= 初始化 ================= */
 try{ new TextDecoder('gbk'); STATE.gbkOK=true; }catch(e){ STATE.gbkOK=false; }
 syncEnc('utf-8');
-applyStyle(STATE.fontSize, STATE.lineHeight, STATE.fg, STATE.bg);
+/* 恢复全局主题偏好（正文默认色随主题，用户自定义色优先） */
+var savedTheme='light';
+try{ savedTheme=localStorage.getItem(THEME_KEY)||'light'; }catch(e){}
+applyTheme(savedTheme, false);
 if(document.fonts && document.fonts.ready){
   document.fonts.ready.then(function(){ if(STATE.text) render(); });
 }
